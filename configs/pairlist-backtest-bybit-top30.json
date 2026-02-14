@@ -1,0 +1,41 @@
+{
+  "stake_currency": "USDT",
+  "exchange": {
+    "name": "bybit",
+    "pair_whitelist": [
+      "BTC/USDT:USDT",
+      "ETH/USDT:USDT",
+      "SOL/USDT:USDT",
+      "XRP/USDT:USDT",
+      "DOGE/USDT:USDT",
+      "ADA/USDT:USDT",
+      "AVAX/USDT:USDT",
+      "DOT/USDT:USDT",
+      "LINK/USDT:USDT",
+      "SUI/USDT:USDT",
+      "NEAR/USDT:USDT",
+      "ARB/USDT:USDT",
+      "OP/USDT:USDT",
+      "WIF/USDT:USDT",
+      "FET/USDT:USDT",
+      "PEPE/USDT:USDT",
+      "UNI/USDT:USDT",
+      "AAVE/USDT:USDT",
+      "LTC/USDT:USDT",
+      "ATOM/USDT:USDT",
+      "TIA/USDT:USDT",
+      "SEI/USDT:USDT",
+      "INJ/USDT:USDT",
+      "WLD/USDT:USDT",
+      "RENDER/USDT:USDT",
+      "APT/USDT:USDT",
+      "FIL/USDT:USDT",
+      "SHIB/USDT:USDT",
+      "TRX/USDT:USDT",
+      "HBAR/USDT:USDT"
+    ]
+  },
+  "pairlists": [
+    {"method": "StaticPairList"}
+  ]
+}
