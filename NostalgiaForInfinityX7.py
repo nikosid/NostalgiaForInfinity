@@ -5,7 +5,6 @@ import rapidjson
 import numpy as np
 import talib.abstract as ta
 import pandas as pd
-import pandas_ta as pta
 from freqtrade.strategy.interface import IStrategy
 from freqtrade.strategy import merge_informative_pair
 from pandas import DataFrame, Series
@@ -70,7 +69,7 @@ class NostalgiaForInfinityX7(IStrategy):
   INTERFACE_VERSION = 3
 
   def version(self) -> str:
-    return "v17.4.109"
+    return "v17.4.124"
 
   stoploss = -0.99
 
@@ -787,7 +786,7 @@ class NostalgiaForInfinityX7(IStrategy):
   profit_max_thresholds = [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.05, 0.05]
 
   # Max allowed buy "slippage", how high to buy on the candle
-  max_slippage = 0.01
+  max_slippage = 0.02
 
   # BTC/ETH stakes
   btc_stakes = ["BTC", "ETH"]
@@ -978,13 +977,13 @@ class NostalgiaForInfinityX7(IStrategy):
     # OKX, Kraken provides a lower number of candle data per API call
     if self.config["exchange"]["name"] in ["okx", "okex"]:
       self.startup_candle_count = 480
-    elif self.config["exchange"]["name"] in ["kraken"]:
+    elif self.config["exchange"]["name"] == "kraken":
       self.startup_candle_count = 710
-    elif self.config["exchange"]["name"] in ["bybit"]:
+    elif self.config["exchange"]["name"] == "bybit":
       self.startup_candle_count = 199
-    elif self.config["exchange"]["name"] in ["bitget"]:
+    elif self.config["exchange"]["name"] == "bitget":
       self.startup_candle_count = 499
-    elif self.config["exchange"]["name"] in ["bingx"]:
+    elif self.config["exchange"]["name"] == "bingx":
       self.startup_candle_count = 499
 
     if ("trading_mode" in self.config) and (self.config["trading_mode"] in ["futures", "margin"]):
@@ -1064,9 +1063,7 @@ class NostalgiaForInfinityX7(IStrategy):
     enter_tags,
   ) -> tuple:
     is_backtest = self.is_backtest_mode()
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
     is_derisk = False
     if previous_sell_reason in [
       f"exit_{mode_name}_stoploss_doom",
@@ -1075,17 +1072,12 @@ class NostalgiaForInfinityX7(IStrategy):
     ]:
       filled_entries = trade.select_filled_orders(trade.entry_side)
       filled_exits = trade.select_filled_orders(trade.exit_side)
-      has_order_tags = False
-      if hasattr(filled_entries[0], "ft_order_tag"):
-        has_order_tags = True
+      has_order_tags = hasattr(filled_entries[0], "ft_order_tag")
       for order in filled_exits:
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
+            order_tag = order.ft_order_tag.partition(" ")[0]
         if order_tag in ["d", "d1", "derisk_level_1", "derisk_level_2", "derisk_level_3"]:
           is_derisk = True
           break
@@ -1158,7 +1150,7 @@ class NostalgiaForInfinityX7(IStrategy):
         )
       ):
         return True, previous_sell_reason
-    elif previous_sell_reason in [f"exit_{mode_name}_stoploss_u_e"]:
+    elif previous_sell_reason == f"exit_{mode_name}_stoploss_u_e":
       if profit_init_ratio > 0.0:
         # profit is over the threshold, don't exit
         self._remove_profit_target(pair)
@@ -1168,7 +1160,7 @@ class NostalgiaForInfinityX7(IStrategy):
         return False, None
       elif profit_ratio < (previous_profit - (0.04 / trade.leverage)):
         return True, previous_sell_reason
-    elif previous_sell_reason in [f"exit_profit_{mode_name}_max"]:
+    elif previous_sell_reason == f"exit_profit_{mode_name}_max":
       if profit_init_ratio < -0.08:
         # profit is under the threshold, cancel it
         self._remove_profit_target(pair)
@@ -1705,6 +1697,93 @@ class NostalgiaForInfinityX7(IStrategy):
 
     return False, None
 
+  # Filled Order Snapshot
+  # ---------------------------------------------------------------------------------------------
+  def filled_order_snapshot(self, trade: "Trade") -> tuple:
+    filled_orders = trade.select_filled_orders()
+    filled_entries = []
+    filled_exits = []
+    entry_side = trade.entry_side
+    exit_side = trade.exit_side
+    for order in filled_orders:
+      order_side = order.ft_order_side
+      if order_side == entry_side:
+        filled_entries.append(order)
+      elif order_side == exit_side:
+        filled_exits.append(order)
+    return filled_orders, filled_entries, filled_exits
+
+  def trade_order_state(self, trade: "Trade") -> tuple:
+    last_order = trade.orders[-1] if trade.orders else None
+    return (
+      len(trade.orders),
+      getattr(last_order, "id", None),
+      getattr(last_order, "status", None),
+      getattr(last_order, "filled", None),
+    )
+
+  def cache_backtest_profit_snapshot(
+    self,
+    trade: "Trade",
+    current_time: "datetime",
+    exit_rate: float,
+    filled_orders: "Orders",
+    filled_entries: "Orders",
+    filled_exits: "Orders",
+    profit_values: tuple,
+  ) -> None:
+    if not self.is_backtest_mode():
+      return
+
+    trade_key = trade.id if trade.id is not None else id(trade)
+    self._backtest_profit_snapshot = (
+      trade_key,
+      current_time,
+      exit_rate,
+      self.trade_order_state(trade),
+      filled_orders,
+      filled_entries,
+      filled_exits,
+      profit_values,
+    )
+
+  def backtest_profit_snapshot(self, trade: "Trade", current_time: "datetime", exit_rate: float) -> tuple | None:
+    if not self.is_backtest_mode():
+      return None
+
+    snapshot = getattr(self, "_backtest_profit_snapshot", None)
+    if snapshot is None:
+      return None
+
+    (
+      snapshot_trade_id,
+      snapshot_time,
+      snapshot_exit_rate,
+      snapshot_order_state,
+      filled_orders,
+      filled_entries,
+      filled_exits,
+      profit_values,
+    ) = snapshot
+    trade_key = trade.id if trade.id is not None else id(trade)
+    if (
+      snapshot_trade_id == trade_key
+      and snapshot_time == current_time
+      and snapshot_exit_rate == exit_rate
+      and snapshot_order_state == self.trade_order_state(trade)
+    ):
+      return filled_orders, filled_entries, filled_exits, profit_values
+
+    return None
+
+  def profit_or_order_snapshot(self, trade: "Trade", current_time: "datetime", exit_rate: float) -> tuple:
+    profit_snapshot = self.backtest_profit_snapshot(trade, current_time, exit_rate)
+    if profit_snapshot is not None:
+      return profit_snapshot
+
+    filled_orders, filled_entries, filled_exits = self.filled_order_snapshot(trade)
+    return filled_orders, filled_entries, filled_exits, None
+
   # Calc Total Profit
   # ---------------------------------------------------------------------------------------------
   def calc_total_profit(
@@ -1725,32 +1804,33 @@ class NostalgiaForInfinityX7(IStrategy):
     total_amount = 0.0
     total_stake = 0.0
     total_profit = 0.0
-    current_stake = 0.0
-    for entry_order in filled_entries:
-      if trade.is_short:
-        entry_stake = entry_order.safe_filled * entry_order.safe_price * (1 - fee_open_rate)
+    if trade.is_short:
+      fee_open_multiplier = 1 - fee_open_rate
+      fee_close_multiplier = 1 + fee_close_rate
+      for entry_order in filled_entries:
+        entry_stake = entry_order.safe_filled * entry_order.safe_price * fee_open_multiplier
         total_amount += entry_order.safe_filled
         total_stake += entry_stake
         total_profit += entry_stake
-      else:
-        entry_stake = entry_order.safe_filled * entry_order.safe_price * (1 + fee_open_rate)
+      for exit_order in filled_exits:
+        exit_stake = exit_order.safe_filled * exit_order.safe_price * fee_close_multiplier
+        total_amount -= exit_order.safe_filled
+        total_profit -= exit_stake
+      current_stake = total_amount * exit_rate * fee_close_multiplier
+      total_profit -= current_stake
+    else:
+      fee_open_multiplier = 1 + fee_open_rate
+      fee_close_multiplier = 1 - fee_close_rate
+      for entry_order in filled_entries:
+        entry_stake = entry_order.safe_filled * entry_order.safe_price * fee_open_multiplier
         total_amount += entry_order.safe_filled
         total_stake += entry_stake
         total_profit -= entry_stake
-    for exit_order in filled_exits:
-      if trade.is_short:
-        exit_stake = exit_order.safe_filled * exit_order.safe_price * (1 + fee_close_rate)
-        total_amount -= exit_order.safe_filled
-        total_profit -= exit_stake
-      else:
-        exit_stake = exit_order.safe_filled * exit_order.safe_price * (1 - fee_close_rate)
+      for exit_order in filled_exits:
+        exit_stake = exit_order.safe_filled * exit_order.safe_price * fee_close_multiplier
         total_amount -= exit_order.safe_filled
         total_profit += exit_stake
-    if trade.is_short:
-      current_stake = total_amount * exit_rate * (1 + fee_close_rate)
-      total_profit -= current_stake
-    else:
-      current_stake = total_amount * exit_rate * (1 - fee_close_rate)
+      current_stake = total_amount * exit_rate * fee_close_multiplier
       total_profit += current_stake
     if self.is_futures_mode:
       total_profit += trade.funding_fees
@@ -1758,6 +1838,14 @@ class NostalgiaForInfinityX7(IStrategy):
     current_profit_ratio = total_profit / current_stake
     init_profit_ratio = total_profit / filled_entries[0].cost
     return total_profit, total_profit_ratio, current_profit_ratio, init_profit_ratio
+
+  @staticmethod
+  def scale_stakes_for_min_stake(stakes, slice_amount, min_stake, stake_leverage, trade_leverage):
+    if (slice_amount * stakes[0] / stake_leverage) >= min_stake:
+      return stakes
+
+    multi = min_stake / slice_amount / stakes[0] * trade_leverage
+    return [stake * multi for stake in stakes]
 
   # Custom Exit
   # ---------------------------------------------------------------------------------------------
@@ -1767,27 +1855,28 @@ class NostalgiaForInfinityX7(IStrategy):
     df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
     if len(df) < 6:
       return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle_1 = df.iloc[-2].squeeze()
-    previous_candle_2 = df.iloc[-3].squeeze()
-    previous_candle_3 = df.iloc[-4].squeeze()
-    previous_candle_4 = df.iloc[-5].squeeze()
-    previous_candle_5 = df.iloc[-6].squeeze()
+    last_candle = df.iloc[-1]
+    previous_candle_1 = df.iloc[-2]
+    previous_candle_2 = df.iloc[-3]
+    previous_candle_3 = df.iloc[-4]
+    previous_candle_4 = df.iloc[-5]
+    previous_candle_5 = df.iloc[-6]
 
     enter_tag = "empty"
     if hasattr(trade, "enter_tag") and trade.enter_tag is not None:
       enter_tag = trade.enter_tag
     enter_tags = enter_tag.split()
 
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
+    filled_orders, filled_entries, filled_exits = self.filled_order_snapshot(trade)
 
     profit_stake = 0.0
     profit_ratio = 0.0
     profit_current_stake_ratio = 0.0
     profit_init_ratio = 0.0
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, current_rate
+    profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, current_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
+    self.cache_backtest_profit_snapshot(
+      trade, current_time, current_rate, filled_orders, filled_entries, filled_exits, profit_values
     )
 
     max_profit = 0.0
@@ -1804,6 +1893,7 @@ class NostalgiaForInfinityX7(IStrategy):
         profit_init_ratio,
         max_profit,
         max_loss,
+        filled_orders,
         filled_entries,
         filled_exits,
         last_candle,
@@ -2081,6 +2171,7 @@ class NostalgiaForInfinityX7(IStrategy):
         profit_init_ratio,
         max_profit,
         max_loss,
+        filled_orders,
         filled_entries,
         filled_exits,
         last_candle,
@@ -2286,6 +2377,7 @@ class NostalgiaForInfinityX7(IStrategy):
         profit_init_ratio,
         max_profit,
         max_loss,
+        filled_orders,
         filled_entries,
         filled_exits,
         last_candle,
@@ -2328,6 +2420,7 @@ class NostalgiaForInfinityX7(IStrategy):
         profit_init_ratio,
         max_profit,
         max_loss,
+        filled_orders,
         filled_entries,
         filled_exits,
         last_candle,
@@ -2539,10 +2632,8 @@ class NostalgiaForInfinityX7(IStrategy):
     is_long_grind_mode = all(c in self.long_grind_mode_tags for c in enter_tags)
     is_long_btc_mode = all(c in self.long_btc_mode_tags for c in enter_tags)
     is_short_grind_mode = all(c in self.short_grind_mode_tags for c in enter_tags)
-    is_v2_date = trade.open_date_utc.replace(tzinfo=None) >= datetime(2025, 2, 13) or is_backtest
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_v2_date = is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2025, 2, 13)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
 
     # Rebuy mode
     if not trade.is_short and (
@@ -2988,19 +3079,101 @@ class NostalgiaForInfinityX7(IStrategy):
     return list(informative_pairs)
 
   @staticmethod
-  def chaikin_money_flow(
-    high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timeperiod: int = 20
-  ) -> np.ndarray:
+  def rolling_sum(arr: np.ndarray, timeperiod: int) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float64)
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    if arr.size < timeperiod:
+      return out
 
+    out[timeperiod - 1 :] = np.convolve(arr, np.ones(timeperiod, dtype=np.float64), mode="valid")
+    return out
+
+  @staticmethod
+  def chaikin_money_flow(high, low, close, volume, timeperiod=20):
     hl_range = high - low
-    hl_range = np.where(hl_range == 0, np.nan, hl_range)
-    mfm = ((close - low) - (high - close)) / hl_range
-    mfv = mfm * volume
-    mfv_sum = pd.Series(mfv).rolling(timeperiod).sum().to_numpy()
-    vol_sum = pd.Series(volume).rolling(timeperiod).sum().to_numpy()
-    cmf = mfv_sum / np.where(vol_sum == 0, np.nan, vol_sum)
+    mfm = np.divide(
+      ((close - low) - (high - close)),
+      hl_range,
+      out=np.full_like(close, np.nan, dtype=np.float64),
+      where=hl_range != 0,
+    )
 
-    return np.nan_to_num(cmf, nan=0.0)
+    mfv = mfm * volume
+    mfv_sum = __class__.rolling_sum(mfv, timeperiod)
+    vol_sum = ta.SUM(volume, timeperiod=timeperiod)
+
+    return mfv_sum / vol_sum
+
+  @staticmethod
+  def stoch_k(high, low, close):
+    stoch_k = ta.STOCHF(high, low, close, fastk_period=14, fastd_period=3, fastd_matype=0)[1]
+    stoch_k[:17] = np.nan
+    return stoch_k
+
+  @staticmethod
+  def fast_pct_change(arr: np.ndarray) -> np.ndarray:
+    out = np.empty_like(arr)
+    out[0] = np.nan
+    prev = arr[:-1]
+    np.divide((arr[1:] - prev), prev, out=out[1:], where=prev != 0)
+    out[1:] *= 100.0
+    return out
+
+  @staticmethod
+  def stochrsi_k(rsi_14: np.ndarray) -> np.ndarray:
+    rsi_min = ta.MIN(rsi_14, timeperiod=14)
+    rsi_max = ta.MAX(rsi_14, timeperiod=14)
+    denom = rsi_max - rsi_min
+    denom = np.where(denom == 0, np.nan, denom)
+    stochrsi = ((rsi_14 - rsi_min) / denom) * 100.0
+    return ta.SMA(stochrsi, timeperiod=3)
+
+  @staticmethod
+  def validate_indicators(df: pd.DataFrame, columns: list[str], pair: str, timeframe: str) -> None:
+    expected_len = len(df)
+    for col in columns:
+      # Missing column
+      if col not in df.columns:
+        log.warning(f"[{pair}] [{timeframe}] Missing column: {col}")
+        continue
+
+      series = df[col]
+
+      # Length check
+      if len(series) != expected_len:
+        log.warning(f"[{pair}] [{timeframe}] {col} length mismatch: {len(series)} != {expected_len}")
+
+      # Dtype check
+      if not pd.api.types.is_numeric_dtype(series):
+        log.warning(f"[{pair}] [{timeframe}] {col} non-numeric dtype: {series.dtype}")
+        continue
+
+      arr = series.to_numpy(copy=False)
+
+      # Empty array protection
+      if arr.size == 0:
+        log.warning(f"[{pair}] [{timeframe}] {col} empty array")
+        continue
+
+      # Inf check
+      inf_count = np.isinf(arr).sum()
+
+      if inf_count:
+        log.warning(f"[{pair}] [{timeframe}] {col} contains {inf_count} inf values")
+
+      # NaN diagnostics
+      nan_count = np.isnan(arr).sum()
+
+      if nan_count == expected_len:
+        log.warning(f"[{pair}] [{timeframe}] {col} is ALL NaN")
+
+      elif nan_count:
+        nan_pct = (nan_count / expected_len) * 100.0
+
+        if nan_pct > 50.0:
+          log.warning(f"[{pair}] [{timeframe}] {col} has {nan_pct:.1f}% NaN")
+        else:
+          log.debug("[%s] [%s] %s NaNs: %s (%.1f%%)", pair, timeframe, col, nan_count, nan_pct)
 
   # Informative 1d Timeframe Indicators
   # ---------------------------------------------------------------------------------------------
@@ -3027,46 +3200,23 @@ class NostalgiaForInfinityX7(IStrategy):
     volume_np = informative_1d["volume"].to_numpy(copy=False)
 
     # =========================================================================
-    # FAST HELPERS
-    # =========================================================================
-
-    def fast_pct_change(arr: np.ndarray) -> np.ndarray:
-      out = np.empty_like(arr)
-      out[0] = np.nan
-      prev = arr[:-1]
-      np.divide((arr[1:] - prev), prev, out=out[1:], where=prev != 0)
-      out[1:] *= 100.0
-      return out
-
-    # =========================================================================
     # CORE INDICATORS
     # =========================================================================
     rsi_3 = ta.RSI(close_np, timeperiod=3)
     rsi_14 = ta.RSI(close_np, timeperiod=14)
-    bb_upper, bb_middle, bb_lower = ta.BBANDS(close_np, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0)
-    bb_middle_safe = np.where(bb_middle == 0, np.nan, bb_middle)
+    # bb_upper, bb_middle, bb_lower = ta.BBANDS(close_np, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0)
+    # bb_middle_safe = np.where(bb_middle == 0, np.nan, bb_middle)
     aroon_down, aroon_up = ta.AROON(high_np, low_np, timeperiod=14)
 
     # =========================================================================
     # STOCH
     # =========================================================================
-
-    try:
-      stoch_k, _ = ta.STOCH(
-        high_np, low_np, close_np, fastk_period=14, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0
-      )
-
-    except Exception:
-      stoch_k = np.full_like(close_np, np.nan)
+    stoch_k = self.stoch_k(high_np, low_np, close_np)
 
     # =========================================================================
     # STOCH RSI
     # =========================================================================
-    rsi_series = pd.Series(rsi_14, copy=False)
-    rsi_min = rsi_series.rolling(14).min()
-    rsi_max = rsi_series.rolling(14).max()
-    stochrsi = ((rsi_series - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)) * 100.0
-    stochrsi_k = stochrsi.rolling(3).mean().to_numpy()
+    stochrsi_k = self.stochrsi_k(rsi_14)
 
     # =========================================================================
     # MONEY FLOW
@@ -3085,8 +3235,8 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # RSI CHANGE %
     # =========================================================================
-    rsi3_change = fast_pct_change(rsi_3)
-    rsi14_change = fast_pct_change(rsi_14)
+    rsi3_change = self.fast_pct_change(rsi_3)
+    # rsi14_change = self.fast_pct_change(rsi_14)
 
     # =========================================================================
     # CANDLE %
@@ -3124,9 +3274,9 @@ class NostalgiaForInfinityX7(IStrategy):
         # Core indicators
         "RSI_3": rsi_3,
         "RSI_14": rsi_14,
-        "BBL_20_2.0": bb_lower,
-        "BBU_20_2.0": bb_upper,
-        "BBB_20_2.0": ((bb_upper - bb_lower) / bb_middle_safe) * 100.0,
+        # "BBL_20_2.0": bb_lower,
+        # "BBU_20_2.0": bb_upper,
+        # "BBB_20_2.0": ((bb_upper - bb_lower) / bb_middle_safe) * 100.0,
         # Stoch
         "STOCHk_14_3_3": stoch_k,
         # Stoch RSI
@@ -3142,7 +3292,7 @@ class NostalgiaForInfinityX7(IStrategy):
         "ROC_9": roc_9,
         # Change %
         "RSI_3_change_pct": rsi3_change,
-        "RSI_14_change_pct": rsi14_change,
+        # "RSI_14_change_pct": rsi14_change,
         # Candle %
         "change_pct": change_pct,
         # Wick %
@@ -3165,77 +3315,47 @@ class NostalgiaForInfinityX7(IStrategy):
 
     # Enable ONLY during debugging
     debug = False
-    debug_cols = [
-      "RSI_3",
-      "RSI_14",
-      "RSI_3_change_pct",
-      "RSI_14_change_pct",
-      "BBL_20_2.0",
-      "BBU_20_2.0",
-      "BBB_20_2.0",
-      "MFI_14",
-      "CMF_20",
-      "WILLR_14",
-      "AROONU_14",
-      "AROOND_14",
-      "STOCHk_14_3_3",
-      "STOCHRSIk_14_14_3_3",
-      "ROC_2",
-      "ROC_9",
-      "change_pct",
-      "top_wick_pct",
-      "bot_wick_pct",
-      "high_max_6",
-      "high_max_12",
-      "high_max_20",
-      "high_max_30",
-      "low_min_6",
-      "low_min_12",
-      "low_min_20",
-      "low_min_30",
-    ]
-
     if debug:
-      expected_len = len(informative_1d)
-      tf = info_timeframe
+      debug_cols = [
+        # Core indicators
+        "RSI_3",
+        "RSI_14",
+        # "BBL_20_2.0",
+        # "BBU_20_2.0",
+        # "BBB_20_2.0",
+        # Stoch
+        "STOCHk_14_3_3",
+        # Stoch RSI
+        "STOCHRSIk_14_14_3_3",
+        # Money Flow
+        "MFI_14",
+        "CMF_20",
+        # Momentum
+        "WILLR_14",
+        "AROONU_14",
+        "AROOND_14",
+        "ROC_2",
+        "ROC_9",
+        # Change %
+        "RSI_3_change_pct",
+        # "RSI_14_change_pct",
+        # Candle %
+        "change_pct",
+        # Wick %
+        "top_wick_pct",
+        "bot_wick_pct",
+        # Rolling
+        "high_max_6",
+        "high_max_12",
+        "high_max_20",
+        "high_max_30",
+        "low_min_6",
+        "low_min_12",
+        "low_min_20",
+        "low_min_30",
+      ]
 
-      for col in debug_cols:
-        # Missing column
-        if col not in informative_1d.columns:
-          log.warning(f"[{metadata['pair']}] [{tf}] Missing column: {col}")
-          continue
-
-        series = informative_1d[col]
-
-        # Length check
-        if len(series) != expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} length mismatch: {len(series)} != {expected_len}")
-
-        # Dtype check
-        if not pd.api.types.is_numeric_dtype(series):
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} non-numeric dtype: {series.dtype}")
-
-        arr = series.to_numpy(copy=False)
-
-        # Inf check
-        inf_count = np.isinf(arr).sum()
-
-        if inf_count > 0:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} contains {inf_count} inf values")
-
-        # NaN diagnostics
-        nan_count = np.isnan(arr).sum()
-
-        if nan_count == expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} is ALL NaN")
-
-        elif nan_count > 0:
-          nan_pct = (nan_count / expected_len) * 100.0
-
-          if nan_pct > 50:
-            log.warning(f"[{metadata['pair']}] [{tf}] {col} has {nan_pct:.1f}% NaN")
-          else:
-            log.debug(f"[{metadata['pair']}] [{tf}] {col} NaNs: {nan_count} ({nan_pct:.1f}%)")
+      self.validate_indicators(df=informative_1d, columns=debug_cols, pair=metadata["pair"], timeframe=info_timeframe)
 
     # =========================================================================
     # LOGGING
@@ -3243,7 +3363,7 @@ class NostalgiaForInfinityX7(IStrategy):
 
     tok = time.perf_counter()
 
-    log.debug(f"[{metadata['pair']}] informative_1d_indicators took: {tok - tik:0.4f} seconds.")
+    log.debug("[%s] informative_1d_indicators took: %.4f seconds.", metadata["pair"], tok - tik)
 
     return informative_1d
 
@@ -3272,62 +3392,33 @@ class NostalgiaForInfinityX7(IStrategy):
     volume_np = informative_4h["volume"].to_numpy(copy=False)
 
     # =========================================================================
-    # FAST HELPERS
-    # =========================================================================
-
-    def fast_pct_change(arr: np.ndarray) -> np.ndarray:
-      out = np.empty_like(arr)
-      out[0] = np.nan
-      prev = arr[:-1]
-      np.divide((arr[1:] - prev), prev, out=out[1:], where=prev != 0)
-      out[1:] *= 100.0
-      return out
-
-    # =========================================================================
     # CORE INDICATORS
     # =========================================================================
     rsi_3 = ta.RSI(close_np, timeperiod=3)
     rsi_14 = ta.RSI(close_np, timeperiod=14)
-    bb_upper, bb_middle, bb_lower = ta.BBANDS(close_np, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0)
-    bb_middle_safe = np.where(bb_middle == 0, np.nan, bb_middle)
+    # bb_upper, bb_middle, bb_lower = ta.BBANDS(close_np, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0)
+    # bb_middle_safe = np.where(bb_middle == 0, np.nan, bb_middle)
     aroon_down, aroon_up = ta.AROON(high_np, low_np, timeperiod=14)
 
     # =========================================================================
     # STOCH
     # =========================================================================
-    try:
-      stoch_k, _ = ta.STOCH(
-        high_np, low_np, close_np, fastk_period=14, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0
-      )
-
-    except Exception:
-      stoch_k = np.full_like(close_np, np.nan)
+    stoch_k = self.stoch_k(high_np, low_np, close_np)
 
     # =========================================================================
     # STOCH RSI
     # =========================================================================
-    rsi_series = pd.Series(rsi_14, copy=False)
-    rsi_min = rsi_series.rolling(14).min()
-    rsi_max = rsi_series.rolling(14).max()
-    stochrsi = ((rsi_series - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)) * 100.0
-    stochrsi_k = stochrsi.rolling(3).mean().to_numpy()
+    stochrsi_k = self.stochrsi_k(rsi_14)
 
     # =========================================================================
-    # KST (KEEP SAFE - pandas-ta can fail)
+    # KST
     # =========================================================================
-    try:
-      kst = pta.kst(pd.Series(close_np))
-      if isinstance(kst, pd.DataFrame):
-        kst_main = kst["KST_10_15_20_30_10_10_10_15"].to_numpy(copy=False)
-        kst_signal = kst["KSTs_9"].to_numpy(copy=False)
-
-      else:
-        kst_main = np.full_like(close_np, np.nan)
-        kst_signal = np.full_like(close_np, np.nan)
-
-    except Exception:
-      kst_main = np.full_like(close_np, np.nan)
-      kst_signal = np.full_like(close_np, np.nan)
+    kst1 = ta.SMA(ta.ROC(close_np, 10), 10)
+    kst2 = ta.SMA(ta.ROC(close_np, 15), 10)
+    kst3 = ta.SMA(ta.ROC(close_np, 20), 10)
+    kst4 = ta.SMA(ta.ROC(close_np, 30), 15)
+    kst_main = kst1 + (2.0 * kst2) + (3.0 * kst3) + (4.0 * kst4)
+    kst_signal = ta.SMA(kst_main, 9)
 
     # =========================================================================
     # MONEY FLOW
@@ -3350,12 +3441,12 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # CHANGE %
     # =========================================================================
-    rsi_3_change = fast_pct_change(rsi_3)
-    rsi_14_change = fast_pct_change(rsi_14)
-    stochrsi_change = fast_pct_change(stochrsi_k)
-    uo_change = fast_pct_change(uo)
-    obv_change = fast_pct_change(obv)
-    cci_change = fast_pct_change(cci_20)
+    rsi_3_change = self.fast_pct_change(rsi_3)
+    rsi_14_change = self.fast_pct_change(rsi_14)
+    stochrsi_change = self.fast_pct_change(stochrsi_k)
+    # uo_change = self.fast_pct_change(uo)
+    obv_change = self.fast_pct_change(obv)
+    cci_change = self.fast_pct_change(cci_20)
 
     # =========================================================================
     # CANDLE %
@@ -3367,11 +3458,11 @@ class NostalgiaForInfinityX7(IStrategy):
     # WICK %
     # =========================================================================
     max_oc = np.maximum(open_np, close_np)
-    min_oc = np.minimum(open_np, close_np)
+    # min_oc = np.minimum(open_np, close_np)
     max_oc_calc = np.where(max_oc == 0, np.nan, max_oc)
-    min_oc_calc = np.where(min_oc == 0, np.nan, min_oc)
+    # min_oc_calc = np.where(min_oc == 0, np.nan, min_oc)
     top_wick_pct = ((high_np - max_oc) / max_oc_calc) * 100.0
-    bot_wick_pct = np.abs(((low_np - min_oc) / min_oc_calc) * 100.0)
+    # bot_wick_pct = np.abs(((low_np - min_oc) / min_oc_calc) * 100.0)
 
     # =========================================================================
     # ROLLING
@@ -3380,13 +3471,13 @@ class NostalgiaForInfinityX7(IStrategy):
     high_max_6 = ta.MAX(high_np, timeperiod=6)
     high_max_12 = ta.MAX(high_np, timeperiod=12)
     high_max_24 = ta.MAX(high_np, timeperiod=24)
-    low_min_6 = ta.MIN(low_np, timeperiod=6)
+    # low_min_6 = ta.MIN(low_np, timeperiod=6)
     low_min_12 = ta.MIN(low_np, timeperiod=12)
     low_min_24 = ta.MIN(low_np, timeperiod=24)
-    change_pct_min_3 = ta.MIN(change_pct, timeperiod=3)
-    change_pct_min_6 = ta.MIN(change_pct, timeperiod=6)
-    change_pct_max_3 = ta.MAX(change_pct, timeperiod=3)
-    change_pct_max_6 = ta.MAX(change_pct, timeperiod=6)
+    # change_pct_min_3 = ta.MIN(change_pct, timeperiod=3)
+    # change_pct_min_6 = ta.MIN(change_pct, timeperiod=6)
+    # change_pct_max_3 = ta.MAX(change_pct, timeperiod=3)
+    # change_pct_max_6 = ta.MAX(change_pct, timeperiod=6)
 
     # =========================================================================
     # ASSIGN DATAFRAME
@@ -3396,9 +3487,9 @@ class NostalgiaForInfinityX7(IStrategy):
         # Core indicators
         "RSI_3": rsi_3,
         "RSI_14": rsi_14,
-        "BBL_20_2.0": bb_lower,
-        "BBU_20_2.0": bb_upper,
-        "BBB_20_2.0": ((bb_upper - bb_lower) / bb_middle_safe) * 100.0,
+        # "BBL_20_2.0": bb_lower,
+        # "BBU_20_2.0": bb_upper,
+        # "BBB_20_2.0": ((bb_upper - bb_lower) / bb_middle_safe) * 100.0,
         "AROONU_14": aroon_up,
         "AROOND_14": aroon_down,
         # Stoch
@@ -3416,7 +3507,7 @@ class NostalgiaForInfinityX7(IStrategy):
         "EMA_200": ema_200,
         "WILLR_14": willr_14,
         "UO_7_14_28": uo,
-        "OBV": obv,
+        # "OBV": obv,
         "ROC_2": roc_2,
         "ROC_9": roc_9,
         "CCI_20": cci_20,
@@ -3425,22 +3516,22 @@ class NostalgiaForInfinityX7(IStrategy):
         "CCI_20_change_pct": cci_change,
         "RSI_3_change_pct": rsi_3_change,
         "RSI_14_change_pct": rsi_14_change,
-        "UO_7_14_28_change_pct": uo_change,
+        # "UO_7_14_28_change_pct": uo_change,
         "OBV_change_pct": obv_change,
         # Candle %
         "change_pct": change_pct,
-        "change_pct_min_3": change_pct_min_3,
-        "change_pct_min_6": change_pct_min_6,
-        "change_pct_max_3": change_pct_max_3,
-        "change_pct_max_6": change_pct_max_6,
-        # Wicks %
+        # "change_pct_min_3": change_pct_min_3,
+        # "change_pct_min_6": change_pct_min_6,
+        # "change_pct_max_3": change_pct_max_3,
+        # "change_pct_max_6": change_pct_max_6,
+        #  Wicks %
         "top_wick_pct": top_wick_pct,
-        "bot_wick_pct": bot_wick_pct,
+        # "bot_wick_pct": bot_wick_pct,
         # Rolling
         "high_max_6": high_max_6,
         "high_max_12": high_max_12,
         "high_max_24": high_max_24,
-        "low_min_6": low_min_6,
+        # "low_min_6": low_min_6,
         "low_min_12": low_min_12,
         "low_min_24": low_min_24,
       },
@@ -3448,81 +3539,71 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     informative_4h = pd.concat([informative_4h, new_cols], axis=1, copy=False)
+
     # Enable ONLY during debugging
     debug = False
-    debug_cols = [
-      "RSI_3",
-      "RSI_14",
-      "EMA_12",
-      "EMA_200",
-      "BBL_20_2.0",
-      "BBU_20_2.0",
-      "BBB_20_2.0",
-      "MFI_14",
-      "CMF_20",
-      "WILLR_14",
-      "AROONU_14",
-      "AROOND_14",
-      "STOCHk_14_3_3",
-      "STOCHRSIk_14_14_3_3",
-      "KST_10_15_20_30_10_10_10_15",
-      "KSTs_9",
-      "UO_7_14_28",
-      "OBV",
-      "ROC_2",
-      "ROC_9",
-      "CCI_20",
-    ]
-
     if debug:
-      expected_len = len(informative_4h)
-      tf = info_timeframe
+      debug_cols = [
+        # Core indicators
+        "RSI_3",
+        "RSI_14",
+        # "BBL_20_2.0",
+        # "BBU_20_2.0",
+        # "BBB_20_2.0",
+        "AROONU_14",
+        "AROOND_14",
+        # Stoch
+        "STOCHk_14_3_3",
+        # Stoch RSI
+        "STOCHRSIk_14_14_3_3",
+        # KST
+        "KST_10_15_20_30_10_10_10_15",
+        "KSTs_9",
+        # Money Flow
+        "MFI_14",
+        "CMF_20",
+        # Momentum
+        "EMA_12",
+        "EMA_200",
+        "WILLR_14",
+        "UO_7_14_28",
+        # "OBV",
+        "ROC_2",
+        "ROC_9",
+        "CCI_20",
+        # Change %
+        "STOCHRSIk_14_14_3_3_change_pct",
+        "CCI_20_change_pct",
+        "RSI_3_change_pct",
+        "RSI_14_change_pct",
+        # "UO_7_14_28_change_pct",
+        "OBV_change_pct",
+        # Candle %
+        "change_pct",
+        # "change_pct_min_3",
+        # "change_pct_min_6",
+        # "change_pct_max_3",
+        # "change_pct_max_6",
+        # Wicks %
+        # "top_wick_pct",
+        # "bot_wick_pct",
+        # Rolling
+        "high_max_6",
+        "high_max_12",
+        "high_max_24",
+        # "low_min_6",
+        "low_min_12",
+        "low_min_24",
+      ]
 
-      for col in debug_cols:
-        # Missing column
-        if col not in informative_4h.columns:
-          log.warning(f"[{metadata['pair']}] [{tf}] Missing column: {col}")
-          continue
-
-        series = informative_4h[col]
-
-        # Length check
-        if len(series) != expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} length mismatch: {len(series)} != {expected_len}")
-
-        # Dtype check
-        if not pd.api.types.is_numeric_dtype(series):
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} non-numeric dtype: {series.dtype}")
-
-        arr = series.to_numpy(copy=False)
-
-        # Inf check
-        inf_count = np.isinf(arr).sum()
-
-        if inf_count > 0:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} contains {inf_count} inf values")
-
-        # NaN diagnostics
-        nan_count = np.isnan(arr).sum()
-
-        if nan_count == expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} is ALL NaN")
-
-        elif nan_count > 0:
-          nan_pct = (nan_count / expected_len) * 100.0
-
-          if nan_pct > 50:
-            log.warning(f"[{metadata['pair']}] [{tf}] {col} has {nan_pct:.1f}% NaN")
-          else:
-            log.debug(f"[{metadata['pair']}] [{tf}] {col} NaNs: {nan_count} ({nan_pct:.1f}%)")
-
+      self.validate_indicators(df=informative_4h, columns=debug_cols, pair=metadata["pair"], timeframe=info_timeframe)
     # =========================================================================
     # LOGGING
     # =========================================================================
 
     tok = time.perf_counter()
 
-    log.debug(f"[{metadata['pair']}] informative_4h_indicators took: {tok - tik:0.4f} seconds.")
+    log.debug("[%s] informative_4h_indicators took: %.4f seconds.", metadata["pair"], tok - tik)
 
     return informative_4h
 
@@ -3554,18 +3635,6 @@ class NostalgiaForInfinityX7(IStrategy):
     volume_np = informative_1h["volume"].to_numpy(copy=False)
 
     # =========================================================================
-    # FAST HELPERS
-    # =========================================================================
-
-    def fast_pct_change(arr: np.ndarray) -> np.ndarray:
-      out = np.empty_like(arr)
-      out[0] = np.nan
-      prev = arr[:-1]
-      np.divide((arr[1:] - prev), prev, out=out[1:], where=prev != 0)
-      out[1:] *= 100.0
-      return out
-
-    # =========================================================================
     # CORE INDICATORS
     # =========================================================================
     rsi_3 = ta.RSI(close_np, timeperiod=3)
@@ -3577,42 +3646,22 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # STOCH
     # =========================================================================
-
-    try:
-      stoch_k, _ = ta.STOCH(
-        high_np, low_np, close_np, fastk_period=14, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0
-      )
-
-    except Exception:
-      stoch_k = np.full_like(close_np, np.nan)
+    stoch_k = self.stoch_k(high_np, low_np, close_np)
 
     # =========================================================================
     # STOCH RSI
     # =========================================================================
-
-    rsi_series = pd.Series(rsi_14, copy=False)
-    rsi_min = rsi_series.rolling(14).min()
-    rsi_max = rsi_series.rolling(14).max()
-    stochrsi = ((rsi_series - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)) * 100.0
-    stochrsi_k = stochrsi.rolling(3).mean().to_numpy()
+    stochrsi_k = self.stochrsi_k(rsi_14)
 
     # =========================================================================
-    # KST (KEEP SAFE - pandas-ta can fail)
+    # KST
     # =========================================================================
-
-    try:
-      kst = pta.kst(pd.Series(close_np))
-      if isinstance(kst, pd.DataFrame):
-        kst_main = kst["KST_10_15_20_30_10_10_10_15"].to_numpy(copy=False)
-        kst_signal = kst["KSTs_9"].to_numpy(copy=False)
-
-      else:
-        kst_main = np.full_like(close_np, np.nan)
-        kst_signal = np.full_like(close_np, np.nan)
-
-    except Exception:
-      kst_main = np.full_like(close_np, np.nan)
-      kst_signal = np.full_like(close_np, np.nan)
+    kst1 = ta.SMA(ta.ROC(close_np, 10), 10)
+    kst2 = ta.SMA(ta.ROC(close_np, 15), 10)
+    kst3 = ta.SMA(ta.ROC(close_np, 20), 10)
+    kst4 = ta.SMA(ta.ROC(close_np, 30), 15)
+    kst_main = kst1 + (2.0 * kst2) + (3.0 * kst3) + (4.0 * kst4)
+    kst_signal = ta.SMA(kst_main, 9)
 
     # =========================================================================
     # MONEY FLOW
@@ -3629,7 +3678,7 @@ class NostalgiaForInfinityX7(IStrategy):
     willr_14 = ta.WILLR(high_np, low_np, close_np, timeperiod=14)
     willr_84 = ta.WILLR(high_np, low_np, close_np, timeperiod=84)
     uo = ta.ULTOSC(high_np, low_np, close_np)
-    obv = ta.OBV(close_np, volume_np)
+    # obv = ta.OBV(close_np, volume_np)
     roc_2 = ta.ROC(close_np, timeperiod=2)
     roc_9 = ta.ROC(close_np, timeperiod=9)
     cci_20 = ta.CCI(high_np, low_np, close_np, timeperiod=20)
@@ -3637,12 +3686,12 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # CHANGE %
     # =========================================================================
-    rsi_3_change = fast_pct_change(rsi_3)
-    rsi_14_change = fast_pct_change(rsi_14)
-    stochrsi_change = fast_pct_change(stochrsi_k)
-    uo_change = fast_pct_change(uo)
-    obv_change = fast_pct_change(obv)
-    cci_change = fast_pct_change(cci_20)
+    rsi_3_change = self.fast_pct_change(rsi_3)
+    rsi_14_change = self.fast_pct_change(rsi_14)
+    # stochrsi_change = self.fast_pct_change(stochrsi_k)
+    # uo_change = self.fast_pct_change(uo)
+    # obv_change = self.fast_pct_change(obv)
+    cci_change = self.fast_pct_change(cci_20)
 
     # =========================================================================
     # CANDLE %
@@ -3653,12 +3702,12 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # WICK %
     # =========================================================================
-    max_oc = np.maximum(open_np, close_np)
-    min_oc = np.minimum(open_np, close_np)
-    max_oc_calc = np.where(max_oc == 0, np.nan, max_oc)
-    min_oc_calc = np.where(min_oc == 0, np.nan, min_oc)
-    top_wick_pct = ((high_np - max_oc) / max_oc_calc) * 100.0
-    bot_wick_pct = np.abs(((low_np - min_oc) / min_oc_calc) * 100.0)
+    # max_oc = np.maximum(open_np, close_np)
+    # min_oc = np.minimum(open_np, close_np)
+    # max_oc_calc = np.where(max_oc == 0, np.nan, max_oc)
+    # min_oc_calc = np.where(min_oc == 0, np.nan, min_oc)
+    # top_wick_pct = ((high_np - max_oc) / max_oc_calc) * 100.0
+    # bot_wick_pct = np.abs(((low_np - min_oc) / min_oc_calc) * 100.0)
 
     # =========================================================================
     # ROLLING
@@ -3690,20 +3739,20 @@ class NostalgiaForInfinityX7(IStrategy):
         "AROOND_14": aroon_down,
         "STOCHk_14_3_3": stoch_k,
         "STOCHRSIk_14_14_3_3": stochrsi_k,
-        "STOCHRSIk_14_14_3_3_change_pct": stochrsi_change,
+        # "STOCHRSIk_14_14_3_3_change_pct": stochrsi_change,
         "KST_10_15_20_30_10_10_10_15": kst_main,
         "KSTs_9": kst_signal,
         "UO_7_14_28": uo,
-        "UO_7_14_28_change_pct": uo_change,
-        "OBV": obv,
-        "OBV_change_pct": obv_change,
+        # "UO_7_14_28_change_pct": uo_change,
+        # "OBV": obv,
+        # "OBV_change_pct": obv_change,
         "ROC_2": roc_2,
         "ROC_9": roc_9,
         "CCI_20": cci_20,
         "CCI_20_change_pct": cci_change,
         "change_pct": change_pct,
-        "top_wick_pct": top_wick_pct,
-        "bot_wick_pct": bot_wick_pct,
+        # "top_wick_pct": top_wick_pct,
+        # "bot_wick_pct": bot_wick_pct,
         "high_max_6": high_max_6,
         "high_max_12": high_max_12,
         "high_max_24": high_max_24,
@@ -3715,89 +3764,52 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     informative_1h = pd.concat([informative_1h, new_cols], axis=1, copy=False)
+
     # Enable ONLY during debugging
     debug = False
-    debug_cols = [
-      "RSI_3",
-      "RSI_14",
-      "RSI_3_change_pct",
-      "RSI_14_change_pct",
-      "EMA_12",
-      "EMA_200",
-      "SMA_16",
-      "BBL_20_2.0",
-      "BBU_20_2.0",
-      "BBB_20_2.0",
-      "MFI_14",
-      "CMF_20",
-      "WILLR_14",
-      "WILLR_84",
-      "AROONU_14",
-      "AROOND_14",
-      "STOCHk_14_3_3",
-      "STOCHRSIk_14_14_3_3",
-      "STOCHRSIk_14_14_3_3_change_pct",
-      "KST_10_15_20_30_10_10_10_15",
-      "KSTs_9",
-      "UO_7_14_28",
-      "UO_7_14_28_change_pct",
-      "OBV",
-      "OBV_change_pct",
-      "ROC_2",
-      "ROC_9",
-      "CCI_20",
-      "CCI_20_change_pct",
-      "change_pct",
-      "top_wick_pct",
-      "bot_wick_pct",
-      "high_max_6",
-      "high_max_12",
-      "high_max_24",
-      "low_min_6",
-      "low_min_12",
-      "low_min_24",
-    ]
     if debug:
-      expected_len = len(informative_1h)
-      tf = info_timeframe
+      debug_cols = [
+        "RSI_3",
+        "RSI_14",
+        "RSI_3_change_pct",
+        "RSI_14_change_pct",
+        "EMA_12",
+        "EMA_200",
+        "SMA_16",
+        "BBL_20_2.0",
+        "BBU_20_2.0",
+        "BBB_20_2.0",
+        "MFI_14",
+        "CMF_20",
+        "WILLR_14",
+        "WILLR_84",
+        "AROONU_14",
+        "AROOND_14",
+        "STOCHk_14_3_3",
+        "STOCHRSIk_14_14_3_3",
+        # "STOCHRSIk_14_14_3_3_change_pct",
+        "KST_10_15_20_30_10_10_10_15",
+        "KSTs_9",
+        "UO_7_14_28",
+        # "UO_7_14_28_change_pct",
+        # "OBV",
+        # "OBV_change_pct",
+        "ROC_2",
+        "ROC_9",
+        "CCI_20",
+        "CCI_20_change_pct",
+        "change_pct",
+        # "top_wick_pct",
+        # "bot_wick_pct",
+        "high_max_6",
+        "high_max_12",
+        "high_max_24",
+        "low_min_6",
+        "low_min_12",
+        "low_min_24",
+      ]
 
-      for col in debug_cols:
-        # Missing column
-        if col not in informative_1h.columns:
-          log.warning(f"[{metadata['pair']}] [{tf}] Missing column: {col}")
-          continue
-
-        series = informative_1h[col]
-
-        # Length check
-        if len(series) != expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} length mismatch: {len(series)} != {expected_len}")
-
-        # Dtype check
-        if not pd.api.types.is_numeric_dtype(series):
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} non-numeric dtype: {series.dtype}")
-
-        arr = series.to_numpy(copy=False)
-
-        # Inf check
-        inf_count = np.isinf(arr).sum()
-
-        if inf_count > 0:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} contains {inf_count} inf values")
-
-        # NaN diagnostics
-        nan_count = np.isnan(arr).sum()
-
-        if nan_count == expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} is ALL NaN")
-
-        elif nan_count > 0:
-          nan_pct = (nan_count / expected_len) * 100.0
-
-          if nan_pct > 50:
-            log.warning(f"[{metadata['pair']}] [{tf}] {col} has {nan_pct:.1f}% NaN")
-          else:
-            log.debug(f"[{metadata['pair']}] [{tf}] {col} NaNs: {nan_count} ({nan_pct:.1f}%)")
+      self.validate_indicators(df=informative_1h, columns=debug_cols, pair=metadata["pair"], timeframe=info_timeframe)
 
     # =========================================================================
     # LOGGING
@@ -3805,7 +3817,7 @@ class NostalgiaForInfinityX7(IStrategy):
 
     tok = time.perf_counter()
 
-    log.debug(f"[{metadata['pair']}] informative_1h_indicators took: {tok - tik:0.4f} seconds.")
+    log.debug("[%s] informative_1h_indicators took: %.4f seconds.", metadata["pair"], tok - tik)
 
     return informative_1h
 
@@ -3837,18 +3849,6 @@ class NostalgiaForInfinityX7(IStrategy):
     volume_np = informative_15m["volume"].to_numpy(copy=False)
 
     # =========================================================================
-    # FAST HELPERS
-    # =========================================================================
-
-    def fast_pct_change(arr: np.ndarray) -> np.ndarray:
-      out = np.empty_like(arr)
-      out[0] = np.nan
-      prev = arr[:-1]
-      np.divide((arr[1:] - prev), prev, out=out[1:], where=prev != 0)
-      out[1:] *= 100.0
-      return out
-
-    # =========================================================================
     # CORE INDICATORS
     # =========================================================================
     rsi_3 = ta.RSI(close_np, timeperiod=3)
@@ -3858,22 +3858,12 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # STOCH
     # =========================================================================
-    try:
-      stoch_k, _ = ta.STOCH(
-        high_np, low_np, close_np, fastk_period=14, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0
-      )
-
-    except Exception:
-      stoch_k = np.full_like(close_np, np.nan)
+    stoch_k = self.stoch_k(high_np, low_np, close_np)
 
     # =========================================================================
     # STOCH RSI
     # =========================================================================
-    rsi_series = pd.Series(rsi_14, copy=False)
-    rsi_min = rsi_series.rolling(14).min()
-    rsi_max = rsi_series.rolling(14).max()
-    stochrsi = ((rsi_series - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)) * 100.0
-    stochrsi_k = stochrsi.rolling(3).mean().to_numpy()
+    stochrsi_k = self.stochrsi_k(rsi_14)
 
     # =========================================================================
     # MONEY FLOW
@@ -3896,12 +3886,12 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # CHANGE %
     # =========================================================================
-    rsi_3_change = fast_pct_change(rsi_3)
-    rsi_14_change = fast_pct_change(rsi_14)
-    stochrsi_change = fast_pct_change(stochrsi_k)
-    uo_change = fast_pct_change(uo)
-    obv_change = fast_pct_change(obv)
-    cci_change = fast_pct_change(cci_20)
+    rsi_3_change = self.fast_pct_change(rsi_3)
+    rsi_14_change = self.fast_pct_change(rsi_14)
+    # stochrsi_change = self.fast_pct_change(stochrsi_k)
+    uo_change = self.fast_pct_change(uo)
+    obv_change = self.fast_pct_change(obv)
+    cci_change = self.fast_pct_change(cci_20)
 
     # =========================================================================
     # CANDLE %
@@ -3912,12 +3902,12 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # WICK %
     # =========================================================================
-    max_oc = np.maximum(open_np, close_np)
-    min_oc = np.minimum(open_np, close_np)
-    max_oc_calc = np.where(max_oc == 0, np.nan, max_oc)
-    min_oc_calc = np.where(min_oc == 0, np.nan, min_oc)
-    top_wick_pct = ((high_np - max_oc) / max_oc_calc) * 100.0
-    bot_wick_pct = np.abs(((low_np - min_oc) / min_oc_calc) * 100.0)
+    # max_oc = np.maximum(open_np, close_np)
+    # min_oc = np.minimum(open_np, close_np)
+    # max_oc_calc = np.where(max_oc == 0, np.nan, max_oc)
+    # min_oc_calc = np.where(min_oc == 0, np.nan, min_oc)
+    # top_wick_pct = ((high_np - max_oc) / max_oc_calc) * 100.0
+    # bot_wick_pct = np.abs(((low_np - min_oc) / min_oc_calc) * 100.0)
 
     new_cols = pd.DataFrame(
       {
@@ -3935,17 +3925,17 @@ class NostalgiaForInfinityX7(IStrategy):
         "AROOND_14": aroon_down,
         "STOCHk_14_3_3": stoch_k,
         "STOCHRSIk_14_14_3_3": stochrsi_k,
-        "STOCHRSIk_14_14_3_3_change_pct": stochrsi_change,
+        # "STOCHRSIk_14_14_3_3_change_pct": stochrsi_change,
         "UO_7_14_28": uo,
         "UO_7_14_28_change_pct": uo_change,
-        "OBV": obv,
+        # "OBV": obv,
         "OBV_change_pct": obv_change,
         "ROC_9": roc_9,
         "CCI_20": cci_20,
         "CCI_20_change_pct": cci_change,
         "change_pct": change_pct,
-        "top_wick_pct": top_wick_pct,
-        "bot_wick_pct": bot_wick_pct,
+        # "top_wick_pct": top_wick_pct,
+        # "bot_wick_pct": bot_wick_pct,
       },
       index=informative_15m.index,
     )
@@ -3954,74 +3944,36 @@ class NostalgiaForInfinityX7(IStrategy):
 
     # Enable ONLY during debugging
     debug = False
-    debug_cols = [
-      "RSI_3",
-      "RSI_14",
-      "RSI_3_change_pct",
-      "RSI_14_change_pct",
-      "EMA_12",
-      "EMA_20",
-      "EMA_26",
-      "MFI_14",
-      "CMF_20",
-      "WILLR_14",
-      "AROONU_14",
-      "AROOND_14",
-      "STOCHk_14_3_3",
-      "STOCHRSIk_14_14_3_3",
-      "STOCHRSIk_14_14_3_3_change_pct",
-      "UO_7_14_28",
-      "UO_7_14_28_change_pct",
-      "OBV",
-      "OBV_change_pct",
-      "ROC_9",
-      "CCI_20",
-      "CCI_20_change_pct",
-      "change_pct",
-      "top_wick_pct",
-      "bot_wick_pct",
-    ]
     if debug:
-      expected_len = len(informative_15m)
-      tf = info_timeframe
+      debug_cols = [
+        "RSI_3",
+        "RSI_14",
+        "RSI_3_change_pct",
+        "RSI_14_change_pct",
+        "EMA_12",
+        "EMA_20",
+        "EMA_26",
+        "MFI_14",
+        "CMF_20",
+        "WILLR_14",
+        "AROONU_14",
+        "AROOND_14",
+        "STOCHk_14_3_3",
+        "STOCHRSIk_14_14_3_3",
+        # "STOCHRSIk_14_14_3_3_change_pct",
+        "UO_7_14_28",
+        "UO_7_14_28_change_pct",
+        # "OBV",
+        "OBV_change_pct",
+        "ROC_9",
+        "CCI_20",
+        "CCI_20_change_pct",
+        "change_pct",
+        # "top_wick_pct",
+        # "bot_wick_pct",
+      ]
 
-      for col in debug_cols:
-        # Missing column
-        if col not in informative_15m.columns:
-          log.warning(f"[{metadata['pair']}] [{tf}] Missing column: {col}")
-          continue
-
-        series = informative_15m[col]
-
-        # Length check
-        if len(series) != expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} length mismatch: {len(series)} != {expected_len}")
-
-        # Dtype check
-        if not pd.api.types.is_numeric_dtype(series):
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} non-numeric dtype: {series.dtype}")
-
-        arr = series.to_numpy(copy=False)
-
-        # Inf check
-        inf_count = np.isinf(arr).sum()
-
-        if inf_count > 0:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} contains {inf_count} inf values")
-
-        # NaN diagnostics
-        nan_count = np.isnan(arr).sum()
-
-        if nan_count == expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} is ALL NaN")
-
-        elif nan_count > 0:
-          nan_pct = (nan_count / expected_len) * 100.0
-
-          if nan_pct > 50:
-            log.warning(f"[{metadata['pair']}] [{tf}] {col} has {nan_pct:.1f}% NaN")
-          else:
-            log.debug(f"[{metadata['pair']}] [{tf}] {col} NaNs: {nan_count} ({nan_pct:.1f}%)")
+      self.validate_indicators(df=informative_15m, columns=debug_cols, pair=metadata["pair"], timeframe=info_timeframe)
 
     # =========================================================================
     # LOGGING
@@ -4029,7 +3981,7 @@ class NostalgiaForInfinityX7(IStrategy):
 
     tok = time.perf_counter()
 
-    log.debug(f"[{metadata['pair']}] informative_15m_indicators took: {tok - tik:0.4f} seconds.")
+    log.debug("[%s] informative_15m_indicators took: %.4f seconds.", metadata["pair"], tok - tik)
 
     return informative_15m
 
@@ -4046,19 +3998,6 @@ class NostalgiaForInfinityX7(IStrategy):
     low_np = df["low"].to_numpy(copy=False)
     open_np = df["open"].to_numpy(copy=False)
     volume_np = df["volume"].to_numpy(copy=False)
-    volume = df["volume"]
-
-    # =========================================================================
-    # FAST HELPERS
-    # =========================================================================
-
-    def fast_pct_change(arr: np.ndarray) -> np.ndarray:
-      out = np.empty_like(arr)
-      out[0] = np.nan
-      prev = arr[:-1]
-      np.divide((arr[1:] - prev), prev, out=out[1:], where=prev != 0)
-      out[1:] *= 100.0
-      return out
 
     # =========================================================================
     # CORE INDICATORS
@@ -4070,35 +4009,24 @@ class NostalgiaForInfinityX7(IStrategy):
     bb_upper_20, bb_middle_20, bb_lower_20 = ta.BBANDS(close_np, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0)
     bb_middle_20_safe = np.where(bb_middle_20 == 0, np.nan, bb_middle_20)
     bb_upper_40, bb_middle_40, bb_lower_40 = ta.BBANDS(close_np, timeperiod=40, nbdevup=2.0, nbdevdn=2.0, matype=0)
-    bb_middle_40_safe = np.where(bb_middle_40 == 0, np.nan, bb_middle_40)
-    bb_range_40 = np.where((bb_upper_40 - bb_lower_40) == 0, np.nan, (bb_upper_40 - bb_lower_40))
+    # bb_middle_40_safe = np.where(bb_middle_40 == 0, np.nan, bb_middle_40)
+    # bb_range_40 = np.where((bb_upper_40 - bb_lower_40) == 0, np.nan, (bb_upper_40 - bb_lower_40))
     aroon_down, aroon_up = ta.AROON(high_np, low_np, timeperiod=14)
 
     # =========================================================================
     # STOCH RSI
     # =========================================================================
-    rsi_series = pd.Series(rsi_14, copy=False)
-    rsi_min = rsi_series.rolling(14).min()
-    rsi_max = rsi_series.rolling(14).max()
-    stochrsi = ((rsi_series - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)) * 100.0
-    stochrsi_k = stochrsi.rolling(3).mean().to_numpy()
+    stochrsi_k = self.stochrsi_k(rsi_14)
 
     # =========================================================================
-    # KST (KEEP SAFE - pandas-ta can fail)
+    # KST
     # =========================================================================
-    try:
-      kst = pta.kst(pd.Series(close_np))
-      if isinstance(kst, pd.DataFrame):
-        kst_main = kst["KST_10_15_20_30_10_10_10_15"].to_numpy(copy=False)
-        kst_signal = kst["KSTs_9"].to_numpy(copy=False)
-
-      else:
-        kst_main = np.full_like(close_np, np.nan)
-        kst_signal = np.full_like(close_np, np.nan)
-
-    except Exception:
-      kst_main = np.full_like(close_np, np.nan)
-      kst_signal = np.full_like(close_np, np.nan)
+    kst1 = ta.SMA(ta.ROC(close_np, 10), 10)
+    kst2 = ta.SMA(ta.ROC(close_np, 15), 10)
+    kst3 = ta.SMA(ta.ROC(close_np, 20), 10)
+    kst4 = ta.SMA(ta.ROC(close_np, 30), 15)
+    kst_main = kst1 + (2.0 * kst2) + (3.0 * kst3) + (4.0 * kst4)
+    kst_signal = ta.SMA(kst_main, 9)
 
     # =========================================================================
     # MONEY FLOW
@@ -4109,7 +4037,7 @@ class NostalgiaForInfinityX7(IStrategy):
     # =========================================================================
     # MOMENTUM
     # =========================================================================
-    ema_3 = ta.EMA(close_np, timeperiod=3)
+    # ema_3 = ta.EMA(close_np, timeperiod=3)
     ema_9 = ta.EMA(close_np, timeperiod=9)
     ema_12 = ta.EMA(close_np, timeperiod=12)
     ema_16 = ta.EMA(close_np, timeperiod=16)
@@ -4125,7 +4053,7 @@ class NostalgiaForInfinityX7(IStrategy):
     sma_200 = ta.SMA(close_np, timeperiod=200)
     willr_14 = ta.WILLR(high_np, low_np, close_np, timeperiod=14)
     willr_480 = ta.WILLR(high_np, low_np, close_np, timeperiod=480)
-    obv = ta.OBV(close_np, volume_np)
+    # obv = ta.OBV(close_np, volume_np)
     roc_2 = ta.ROC(close_np, timeperiod=2)
     roc_9 = ta.ROC(close_np, timeperiod=9)
 
@@ -4133,9 +4061,9 @@ class NostalgiaForInfinityX7(IStrategy):
     # CHANGE %
     # =========================================================================
 
-    rsi_3_change = fast_pct_change(rsi_3)
-    rsi_14_change = fast_pct_change(rsi_14)
-    obv_change = fast_pct_change(obv)
+    # rsi_3_change = self.fast_pct_change(rsi_3)
+    rsi_14_change = self.fast_pct_change(rsi_14)
+    # obv_change = self.fast_pct_change(obv)
 
     # =========================================================================
     # CANDLE %
@@ -4163,7 +4091,7 @@ class NostalgiaForInfinityX7(IStrategy):
     close_min_6 = ta.MIN(close_np, timeperiod=6)
     close_min_12 = ta.MIN(close_np, timeperiod=12)
     close_min_48 = ta.MIN(close_np, timeperiod=48)
-    num_empty_288 = (volume <= 0).rolling(window=288, min_periods=288).sum().to_numpy()
+    num_empty_288 = ta.SUM((volume_np <= 0).astype(np.float64), timeperiod=288)
 
     new_cols = pd.DataFrame(
       {
@@ -4171,9 +4099,9 @@ class NostalgiaForInfinityX7(IStrategy):
         "RSI_4": rsi_4,
         "RSI_14": rsi_14,
         "RSI_20": rsi_20,
-        "RSI_3_change_pct": rsi_3_change,
+        # "RSI_3_change_pct": rsi_3_change,
         "RSI_14_change_pct": rsi_14_change,
-        "EMA_3": ema_3,
+        # "EMA_3": ema_3,
         "EMA_9": ema_9,
         "EMA_12": ema_12,
         "EMA_16": ema_16,
@@ -4191,10 +4119,10 @@ class NostalgiaForInfinityX7(IStrategy):
         "BBU_20_2.0": bb_upper_20,
         "BBB_20_2.0": ((bb_upper_20 - bb_lower_20) / bb_middle_20_safe) * 100.0,
         "BBL_40_2.0": bb_lower_40,
-        "BBM_40_2.0": bb_middle_40,
-        "BBU_40_2.0": bb_upper_40,
-        "BBB_40_2.0": ((bb_upper_40 - bb_lower_40) / bb_middle_40_safe) * 100.0,
-        "BBP_40_2.0": (close_np - bb_lower_40) / bb_range_40,
+        # "BBM_40_2.0": bb_middle_40,
+        # "BBU_40_2.0": bb_upper_40,
+        # "BBB_40_2.0": ((bb_upper_40 - bb_lower_40) / bb_middle_40_safe) * 100.0,
+        # "BBP_40_2.0": (close_np - bb_lower_40) / bb_range_40,
         "BBD_40_2.0": np.abs(bb_middle_40 - bb_lower_40),
         "BBT_40_2.0": np.abs(close_np - bb_lower_40),
         "MFI_14": mfi_14,
@@ -4206,8 +4134,8 @@ class NostalgiaForInfinityX7(IStrategy):
         "STOCHRSIk_14_14_3_3": stochrsi_k,
         "KST_10_15_20_30_10_10_10_15": kst_main,
         "KSTs_9": kst_signal,
-        "OBV": obv,
-        "OBV_change_pct": obv_change,
+        # "OBV": obv,
+        # "OBV_change_pct": obv_change,
         "ROC_2": roc_2,
         "ROC_9": roc_9,
         "change_pct": change_pct,
@@ -4222,7 +4150,68 @@ class NostalgiaForInfinityX7(IStrategy):
       },
       index=df.index,
     )
+
     df = pd.concat([df, new_cols], axis=1, copy=False)
+
+    # Enable ONLY during debugging
+    debug = False
+    if debug:
+      debug_cols = [
+        "RSI_3",
+        "RSI_4",
+        "RSI_14",
+        "RSI_20",
+        # "RSI_3_change_pct",
+        "RSI_14_change_pct",
+        # "EMA_3",
+        "EMA_9",
+        "EMA_12",
+        "EMA_16",
+        "EMA_20",
+        "EMA_26",
+        "EMA_50",
+        "EMA_100",
+        "EMA_200",
+        "SMA_9",
+        "SMA_16",
+        "SMA_21",
+        "SMA_30",
+        "SMA_200",
+        "BBL_20_2.0",
+        "BBU_20_2.0",
+        "BBB_20_2.0",
+        "BBL_40_2.0",
+        # "BBM_40_2.0",
+        # "BBU_40_2.0",
+        # "BBB_40_2.0",
+        # "BBP_40_2.0",
+        "BBD_40_2.0",
+        "BBT_40_2.0",
+        "MFI_14",
+        "CMF_20",
+        "WILLR_14",
+        "WILLR_480",
+        "AROONU_14",
+        "AROOND_14",
+        "STOCHRSIk_14_14_3_3",
+        "KST_10_15_20_30_10_10_10_15",
+        "KSTs_9",
+        # "OBV",
+        # "OBV_change_pct",
+        "ROC_2",
+        "ROC_9",
+        "change_pct",
+        "close_delta",
+        "close_max_6",
+        "close_max_12",
+        "close_max_48",
+        "close_min_6",
+        "close_min_12",
+        "close_min_48",
+        "num_empty_288",
+      ]
+
+      self.validate_indicators(df=df, columns=debug_cols, pair=metadata["pair"], timeframe=self.timeframe)
 
     # =========================================================================
     # GLOBAL PROTECTIONS
@@ -4232,108 +4221,7 @@ class NostalgiaForInfinityX7(IStrategy):
       df["bt_agefilter_ok"] = False
       df.loc[df.index > (12 * 24 * self.bt_min_age_days), "bt_agefilter_ok"] = True
     else:
-      df["live_data_ok"] = df["volume"].rolling(window=72, min_periods=72).min() > 0
-
-    # Enable ONLY during debugging
-    debug = False
-    debug_cols = [
-      "RSI_3",
-      "RSI_4",
-      "RSI_14",
-      "RSI_20",
-      "RSI_3_change_pct",
-      "RSI_14_change_pct",
-      "EMA_3",
-      "EMA_9",
-      "EMA_12",
-      "EMA_16",
-      "EMA_20",
-      "EMA_26",
-      "EMA_50",
-      "EMA_100",
-      "EMA_200",
-      "SMA_9",
-      "SMA_16",
-      "SMA_21",
-      "SMA_30",
-      "SMA_200",
-      "BBL_20_2.0",
-      "BBU_20_2.0",
-      "BBB_20_2.0",
-      "BBL_40_2.0",
-      "BBM_40_2.0",
-      "BBU_40_2.0",
-      "BBB_40_2.0",
-      "BBP_40_2.0",
-      "BBD_40_2.0",
-      "BBT_40_2.0",
-      "MFI_14",
-      "CMF_20",
-      "WILLR_14",
-      "WILLR_480",
-      "AROONU_14",
-      "AROOND_14",
-      "STOCHRSIk_14_14_3_3",
-      "KST_10_15_20_30_10_10_10_15",
-      "KSTs_9",
-      "OBV",
-      "OBV_change_pct",
-      "ROC_2",
-      "ROC_9",
-      "change_pct",
-      "close_delta",
-      "close_max_6",
-      "close_max_12",
-      "close_max_48",
-      "close_min_6",
-      "close_min_12",
-      "close_min_48",
-      "num_empty_288",
-    ]
-    # =========================================================================
-    # DEBUG VALIDATION
-    # =========================================================================
-    if debug:
-      expected_len = len(df)
-      tf = self.timeframe
-
-      for col in debug_cols:
-        # Missing column
-        if col not in df.columns:
-          log.warning(f"[{metadata['pair']}] [{tf}] Missing column: {col}")
-          continue
-
-        series = df[col]
-
-        # Length check
-        if len(series) != expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} length mismatch: {len(series)} != {expected_len}")
-
-        # Dtype check
-        if not pd.api.types.is_numeric_dtype(series):
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} non-numeric dtype: {series.dtype}")
-
-        arr = series.to_numpy(copy=False)
-
-        # Inf check
-        inf_count = np.isinf(arr).sum()
-
-        if inf_count > 0:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} contains {inf_count} inf values")
-
-        # NaN diagnostics
-        nan_count = np.isnan(arr).sum()
-
-        if nan_count == expected_len:
-          log.warning(f"[{metadata['pair']}] [{tf}] {col} is ALL NaN")
-
-        elif nan_count > 0:
-          nan_pct = (nan_count / expected_len) * 100.0
-
-          if nan_pct > 50:
-            log.warning(f"[{metadata['pair']}] [{tf}] {col} has {nan_pct:.1f}% NaN")
-          else:
-            log.debug(f"[{metadata['pair']}] [{tf}] {col} NaNs: {nan_count} ({nan_pct:.1f}%)")
+      df["live_data_ok"] = ta.MIN(volume_np, timeperiod=72) > 0
 
     # =========================================================================
     # LOGGING
@@ -4341,7 +4229,7 @@ class NostalgiaForInfinityX7(IStrategy):
 
     tok = time.perf_counter()
 
-    log.debug(f"[{metadata['pair']}] base_tf_5m_indicators took: {tok - tik:0.4f} seconds.")
+    log.debug("[%s] base_tf_5m_indicators took: %.4f seconds.", metadata["pair"], tok - tik)
 
     return df
 
@@ -4362,7 +4250,6 @@ class NostalgiaForInfinityX7(IStrategy):
   # BTC Indicators
   # ---------------------------------------------------------------------------------------------
   def _btc_info_indicators(self, btc_info_pair: str, btc_info_timeframe: str, metadata: dict) -> DataFrame:
-
     tik = time.perf_counter()
 
     # -------------------------------------------------------------------------
@@ -4395,7 +4282,7 @@ class NostalgiaForInfinityX7(IStrategy):
 
     tok = time.perf_counter()
 
-    log.debug(f"[{metadata['pair']}] btc_info_{btc_info_timeframe}_indicators took: {tok - tik:0.4f} seconds.")
+    log.debug("[%s] btc_info_%s_indicators took: %.4f seconds.", metadata["pair"], btc_info_timeframe, tok - tik)
 
     return df
 
@@ -4514,7 +4401,7 @@ class NostalgiaForInfinityX7(IStrategy):
       # MERGE
       # ---------------------------------------------------------------------
 
-      df = merge_informative_pair(df, btc_informative, self.timeframe, btc_tf, ffill=True)
+      df = merge_informative_pair(df, btc_informative, self.timeframe, btc_tf, ffill=False)
 
       # ---------------------------------------------------------------------
       # CLEANUP
@@ -4571,7 +4458,7 @@ class NostalgiaForInfinityX7(IStrategy):
       # MERGE
       # ---------------------------------------------------------------------
 
-      df = merge_informative_pair(df, info_indicators, self.timeframe, info_tf, ffill=True)
+      df = merge_informative_pair(df, info_indicators, self.timeframe, info_tf, ffill=False)
 
       # ---------------------------------------------------------------------
       # CLEANUP
@@ -4580,6 +4467,38 @@ class NostalgiaForInfinityX7(IStrategy):
       merge_date_col = f"date_{info_tf}"
       if merge_date_col in df.columns:
         df.drop(columns=merge_date_col, inplace=True)
+
+    # =========================================================================
+    # FINAL FORWARD FILL (ONCE)
+    # =========================================================================
+    df.ffill(inplace=True)
+
+    # =========================================================================
+    # FINAL DEBUG VALIDATION
+    # =========================================================================
+    if debug:
+      if not df.index.is_monotonic_increasing:
+        log.warning(f"[{metadata['pair']}] FINAL DF index NOT monotonic!")
+
+      if df.index.has_duplicates:
+        log.warning(f"[{metadata['pair']}] FINAL DF index has DUPLICATES!")
+
+      # ---------------------------------------------------------------------
+      # FULL NaN COLUMNS
+      # ---------------------------------------------------------------------
+      full_nan_cols = df.columns[df.isna().all()].tolist()
+      if full_nan_cols:
+        log.warning(f"[{metadata['pair']}] FINAL DF FULL NaN cols: {full_nan_cols}")
+
+      # ---------------------------------------------------------------------
+      # RECENT NaN CHECK
+      # ---------------------------------------------------------------------
+      recent_df = df.tail(50)
+
+      recent_nan_cols = [col for col in recent_df.columns if recent_df[col].isna().any()]
+
+      if recent_nan_cols:
+        log.warning(f"[{metadata['pair']}] FINAL DF recent NaNs: {recent_nan_cols}")
 
     # =========================================================================
     # BASE TF INDICATORS LAST
@@ -12136,8 +12055,19 @@ class NostalgiaForInfinityX7(IStrategy):
 
     df["protections_short_rebuy"] = True
 
+    tok_after_protections = time.perf_counter()
+    tok_total = time.perf_counter()
+    log.debug(
+      f"[{metadata['pair']}] "
+      f"populate_indicators pre-protections: "
+      f"{tok_before_protections - tik:0.4f}s | "
+      f"protections: "
+      f"{tok_after_protections - tok_before_protections:0.4f}s | "
+      f"total: "
+      f"{tok_total - tik:0.4f}s"
+    )
     tok = time.perf_counter()
-    log.debug(f"[{metadata['pair']}] Populate indicators took a total of: {tok - tik:0.4f} seconds.")
+    log.debug("[%s] Populate indicators took a total of: %.4f seconds.", metadata["pair"], tok - tik)
 
     return df
 
@@ -12159,66 +12089,36 @@ class NostalgiaForInfinityX7(IStrategy):
     if entry_tag == "force_entry":
       return True
 
-    # Mode configurations (dynamic structure)
-    mode_configs = {
-      "grind": {
-        "tags": self.long_grind_mode_tags,
-        "coins": self.grind_mode_coins,
-        "max_slots": self.grind_mode_max_slots,
-        "log_message": "grind mode",
-      },
-      "top_coins": {
-        "tags": self.long_top_coins_mode_tags,
-        "coins": self.top_coins_mode_coins,
-        "log_message": "top coins mode",
-      },
-      "scalp": {
-        "tags": self.long_scalp_mode_tags,
-        "min_free_slots": self.min_free_slots_scalp_mode,
-        "log_message": "scalp mode",
-      },
-    }
-
     # Mode Validation
-    for mode, config in mode_configs.items():
-      if all(c in config["tags"] for c in entry_tag.split()):
-        if mode == "grind":
-          return self._handle_grind_mode(pair, config, current_time)
-        elif mode == "top_coins":
-          return self._handle_top_coins_mode(pair, config, current_time)
-        elif mode == "scalp":
-          return self._handle_scalp_mode(pair, config, current_time)
+    entry_tags = entry_tag.split()
+    if all(c in self.long_grind_mode_tags for c in entry_tags):
+      return self._handle_grind_mode(pair, current_time)
+    if all(c in self.long_top_coins_mode_tags for c in entry_tags):
+      return self._handle_top_coins_mode(pair, current_time)
+    if all(c in self.long_scalp_mode_tags for c in entry_tags):
+      return self._handle_scalp_mode(pair, current_time)
 
     # Long/Short Slot Validation (only in futures mode)
-    if self.is_futures_mode and (self.futures_max_open_trades_long != 0 or self.futures_max_open_trades_short != 0):
-      open_trades = Trade.get_trades_proxy(is_open=True)
-      long_trades = sum(1 for t in open_trades if t.trade_direction == "long")
-      short_trades = sum(1 for t in open_trades if t.trade_direction == "short")
+    if self.is_futures_mode:
+      max_side_trades = 0
+      if side == "long":
+        max_side_trades = self.futures_max_open_trades_long
+      elif side == "short":
+        max_side_trades = self.futures_max_open_trades_short
 
-      # Long trade limit validation
-      if (
-        side == "long" and self.futures_max_open_trades_long != 0 and long_trades >= self.futures_max_open_trades_long
-      ):
-        log.info(
-          f"[{current_time}] Cancelling entry for {pair} due to long trades reaching the max limit of {self.futures_max_open_trades_long}."
-        )
-        return False
-
-      # Short trade limit validation
-      if (
-        side == "short"
-        and self.futures_max_open_trades_short != 0
-        and short_trades >= self.futures_max_open_trades_short
-      ):
-        log.info(
-          f"[{current_time}] Cancelling entry for {pair} due to short trades reaching the max limit of {self.futures_max_open_trades_short}."
-        )
-        return False
+      if max_side_trades != 0:
+        open_trades = Trade.get_trades_proxy(is_open=True)
+        side_trades = sum(1 for t in open_trades if t.trade_direction == side)
+        if side_trades >= max_side_trades:
+          log.info(
+            f"[{current_time}] Cancelling entry for {pair} due to {side} trades reaching the max limit of {max_side_trades}."
+          )
+          return False
 
     # Slippage Validation
     df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
     if len(df) >= 1:
-      last_candle = df.iloc[-1].squeeze()
+      last_candle = df.iloc[-1]
       if (side == "long" and rate > last_candle["close"]) or (side == "short" and rate < last_candle["close"]):
         slippage = (rate / last_candle["close"]) - 1.0
         if (side == "long" and slippage < self.max_slippage) or (side == "short" and slippage > -self.max_slippage):
@@ -12229,30 +12129,32 @@ class NostalgiaForInfinityX7(IStrategy):
 
     return True
 
-  def _handle_grind_mode(self, pair: str, config: dict, current_time: datetime) -> bool:
-    is_pair_grind_mode = pair.split("/")[0] in config["coins"]
+  def _handle_grind_mode(self, pair: str, current_time: datetime) -> bool:
+    is_pair_grind_mode = pair.partition("/")[0] in self.grind_mode_coins
     if not is_pair_grind_mode:
       log.info(f"[{current_time}] Cancelling entry for {pair} due to not being in grind mode coins list.")
       return False
 
     open_trades = Trade.get_trades_proxy(is_open=True)
-    num_open_grind_mode = sum(1 for t in open_trades if all(c in config["tags"] for c in t.enter_tag.split()))
-    if num_open_grind_mode >= config["max_slots"]:
+    num_open_grind_mode = sum(
+      1 for t in open_trades if all(c in self.long_grind_mode_tags for c in t.enter_tag.split())
+    )
+    if num_open_grind_mode >= self.grind_mode_max_slots:
       log.info(f"[{current_time}] Cancelling entry for {pair} due to grind mode slots limit reached.")
       return False
 
     return True
 
-  def _handle_top_coins_mode(self, pair: str, config: dict, current_time: datetime) -> bool:
-    is_pair_top_coins_mode = pair.split("/")[0] in config["coins"]
+  def _handle_top_coins_mode(self, pair: str, current_time: datetime) -> bool:
+    is_pair_top_coins_mode = pair.partition("/")[0] in self.top_coins_mode_coins
     if not is_pair_top_coins_mode:
       log.info(f"[{current_time}] Cancelling entry for {pair} due to not being in top coins list.")
       return False
     return True
 
-  def _handle_scalp_mode(self, pair: str, config: dict, current_time: datetime) -> bool:
+  def _handle_scalp_mode(self, pair: str, current_time: datetime) -> bool:
     current_free_slots = self.config["max_open_trades"] - Trade.get_open_trade_count()
-    if current_free_slots < config["min_free_slots"]:
+    if current_free_slots < self.min_free_slots_scalp_mode:
       log.info(f"[{current_time}] Cancelling entry for {pair} due to insufficient free slots.")
       return False
     return True
@@ -12334,7 +12236,7 @@ class NostalgiaForInfinityX7(IStrategy):
   # Correct Min Stake
   # ---------------------------------------------------------------------------------------------
   def correct_min_stake(self, min_stake: float) -> float:
-    if self.config["exchange"]["name"] in ["bybit"]:
+    if self.config["exchange"]["name"] == "bybit":
       if self.is_futures_mode:
         if min_stake < 5.0 / self.futures_mode_leverage:
           min_stake = 5.0 / self.futures_mode_leverage
@@ -12356,10 +12258,22 @@ class NostalgiaForInfinityX7(IStrategy):
     """Check if the current system is v3_2"""
     return trade.get_custom_data(key="system_version") == self.system_v3_2_name
 
-  def has_valid_entry_conditions(self, trade: Trade, exit_rate: float, last_candle, previous_candle) -> bool:
+  def get_system_version_flags(self, trade: Trade) -> tuple[bool, bool, bool]:
+    """Check the current system version flags with one custom-data lookup."""
+    system_version = trade.get_custom_data(key="system_version")
+    return (
+      system_version == self.system_v3_name,
+      system_version == self.system_v3_1_name,
+      system_version == self.system_v3_2_name,
+    )
+
+  def has_valid_entry_conditions(
+    self, trade: Trade, exit_rate: float, last_candle, previous_candle, filled_orders=None
+  ) -> bool:
     """Check if there are valid entry conditions"""
-    filled_orders = trade.select_filled_orders()
-    if len(filled_orders) < 1:
+    if filled_orders is None:
+      filled_orders = trade.select_filled_orders()
+    if not filled_orders:
       return False
     slice_profit = (exit_rate - filled_orders[-1].safe_price) / filled_orders[-1].safe_price
     if not trade.is_short:
@@ -12581,8 +12495,9 @@ class NostalgiaForInfinityX7(IStrategy):
     if not is_backtest:
       current_free_slots = self.config["max_open_trades"] - Trade.get_open_trade_count()
     # Grind mode
+    pair_coin = metadata["pair"].partition("/")[0]
     num_open_long_grind_mode = 0
-    is_pair_long_grind_mode = metadata["pair"].split("/")[0] in self.grind_mode_coins
+    is_pair_long_grind_mode = pair_coin in self.grind_mode_coins
     if not is_backtest:
       open_trades = Trade.get_trades_proxy(is_open=True)
       for open_trade in open_trades:
@@ -12592,8 +12507,8 @@ class NostalgiaForInfinityX7(IStrategy):
           if all(c in self.long_grind_mode_tags for c in enter_tags):
             num_open_long_grind_mode += 1
     # Top Coins mode
-    is_pair_long_top_coins_mode = metadata["pair"].split("/")[0] in self.top_coins_mode_coins
-    is_pair_short_top_coins_mode = metadata["pair"].split("/")[0] in self.top_coins_mode_coins
+    is_pair_long_top_coins_mode = pair_coin in self.top_coins_mode_coins
+    is_pair_short_top_coins_mode = pair_coin in self.top_coins_mode_coins
     # if BTC/ETH stake
     is_btc_stake = self.config["stake_currency"] in self.btc_stakes
     allowed_empty_candles_288 = 144 if is_btc_stake else 60
@@ -12616,9 +12531,9 @@ class NostalgiaForInfinityX7(IStrategy):
     #
 
     for enabled_long_entry_signal in self.long_entry_signal_params:
-      long_entry_condition_index = int(enabled_long_entry_signal.split("_")[3])
+      long_entry_condition_index = int(enabled_long_entry_signal.rsplit("_", 2)[1])
       item_buy_protection_list = [True]
-      if self.long_entry_signal_params[f"{enabled_long_entry_signal}"]:
+      if self.long_entry_signal_params[enabled_long_entry_signal]:
         # Long Entry Conditions Starts Here
         # -----------------------------------------------------------------------------------------
         long_entry_logic = []
@@ -12651,6 +12566,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3"] > 3.0) | (df["RSI_3_4h"] > 25.0) | (df["AROONU_14_4h"] < 70.0))
             # 5m down move, 15m high
             & ((df["RSI_3"] > 3.0) | (df["AROONU_14_15m"] < 80.0))
+            # 5m down move, 1h high, 4h overbought
+            & ((df["RSI_3"] > 3.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 5m & 4h down move, 4h high
             & ((df["RSI_3"] > 5.0) | (df["RSI_3_4h"] > 35.0) | (df["AROONU_14_4h"] < 70.0))
             # 15m down move, 1h downtrend, 1h high
@@ -12791,6 +12708,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 20.0) | (df["AROONU_14_1h"] < 100.0) | (df["AROONU_14_4h"] < 100.0))
             # 15m down move, 1h high & overbought
             & ((df["RSI_3_15m"] > 20.0) | (df["AROONU_14_1h"] < 100.0) | (df["ROC_9_1h"] < 20.0))
+            # 15m down move, 4h high & overbought
+            & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_4h"] < 100.0) | (df["ROC_9_4h"] < 10.0))
             # 15m down move, 1d overbought
             & ((df["RSI_3_15m"] > 30.0) | (df["ROC_9_1d"] < 80.0))
             # 15m & 4h down move, 15m high
@@ -12891,6 +12810,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_1h"] > 40.0) | (df["AROONU_14_1h"] < 80.0) | (df["ROC_9_15m"] > -15.0))
             # 1h down move, 1h high, 1d overbought
             & ((df["RSI_3_1h"] > 40.0) | (df["AROONU_14_1h"] < 80.0) | (df["ROC_9_1d"] < 100.0))
+            # 1h down move, 1h high, 4h overbought
+            & ((df["RSI_3_1h"] > 40.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 1h down move, 1h & 4h high
             & ((df["RSI_3_1h"] > 45.0) | (df["AROONU_14_1h"] < 80.0) | (df["AROONU_14_4h"] < 100.0))
             # 1h down move, 1h high & overbought
@@ -13154,6 +13075,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 5.0) | (df["RSI_3_1h"] > 10.0) | (df["AROONU_14_4h"] < 100.0))
             # 15m & 1h down move, 4h high
             & ((df["RSI_3_15m"] > 5.0) | (df["RSI_3_1h"] > 15.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 60.0))
+            # 1d down move, 1d still high, 4h still high
+            & ((df["RSI_3_1d"] > 50.0) | (df["RSI_14_1d"] < 50.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 50.0))
             # 15m & 1h down move, 1h high
             & ((df["RSI_3_15m"] > 5.0) | (df["RSI_3_1h"] > 40.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 80.0))
             # 15m & 1h down move, 1h high
@@ -13354,6 +13277,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_1h"] < 70.0) | (df["ROC_9_1d"] < 50.0))
             # 15m down move, 4h high, 1d overbought
             & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_4h"] < 70.0) | (df["ROC_9_1d"] < 50.0))
+            # 15m down move, 4h high, 1h overbought
+            & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_4h"] < 80.0) | (df["ROC_9_1h"] < 50.0))
             # 15m down move, 4h high & overbought
             & ((df["RSI_3_15m"] > 30.0) | (df["AROONU_14_4h"] < 70.0) | (df["ROC_9_4h"] < 50.0))
             # 15m down move, 1h high, 1d downtrend
@@ -13378,6 +13303,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 3.0) | (df["ROC_9_15m"] > -30.0))
             # 1h & 4h down move, 4h still high
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 5.0) | (df["AROONU_14_4h"] < 40.0))
+            # 1h & 4h down move, 1d still high
+            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 40.0))
             # 1h & 4h down move, 4h still high
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 15.0) | (df["RSI_14_4h"] < 40.0))
             # 1h & 4h down move, 1h still not low enough
@@ -14444,6 +14371,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3"] > 3.0) | (df["RSI_3_4h"] > 25.0) | (df["AROONU_14_4h"] < 70.0))
             # 5m & 1d down move, 15m still high
             & ((df["RSI_3"] > 3.0) | (df["RSI_3_1d"] > 20.0) | (df["STOCHRSIk_14_14_3_3_15m"] < 40.0))
+            # 5m down move, 1h high, 4h overbought
+            & ((df["RSI_3"] > 3.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 5m & 4h down move, 15m still high
             & ((df["RSI_3"] > 5.0) | (df["RSI_3_4h"] > 25.0) | (df["STOCHRSIk_14_14_3_3_15m"] < 50.0))
             # 5m down move, 4h high, 1h overbought
@@ -14454,6 +14383,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 5.0) | (df["RSI_3_1h"] > 10.0) | (df["AROONU_14_1d"] < 50.0))
             # 15m & 1h down move, 1h still high
             & ((df["RSI_3_15m"] > 5.0) | (df["RSI_3_1h"] > 30.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 40.0))
+            # 15m & 1h down move, 1d overbought
+            & ((df["RSI_3_15m"] > 5.0) | (df["RSI_3_1h"] > 30.0) | (df["ROC_9_1d"] < 50.0))
             # 15m & 1h down move, 4h high
             & ((df["RSI_3_15m"] > 5.0) | (df["RSI_3_1h"] > 40.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 70.0))
             # 15m & 4h down move, 1d overbought
@@ -14604,6 +14535,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_1h"] > 35.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 50.0) | (df["ROC_9_1d"] < 200.0))
             # 1h down move, 1h high, 4h downtrend
             & ((df["RSI_3_1h"] > 35.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 70.0) | (df["ROC_9_4h"] > -20.0))
+            # 1h down move, 1h high, 4h overbought
+            & ((df["RSI_3_1h"] > 40.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 1h down move, 1h & 4h high
             & ((df["RSI_3_1h"] > 45.0) | (df["AROONU_14_1h"] < 70.0) | (df["AROONU_14_4h"] < 100.0))
             # 1h down move, 4h high, 1d downtrend
@@ -14736,6 +14669,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_15m"] < 30.0) | (df["AROONU_14_4h"] < 60.0))
             # 15m down move, 15m high, 1h high
             & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_15m"] < 60.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 70.0))
+            # 15m down move, 1h & 4h overbought
+            & ((df["RSI_3_15m"] > 25.0) | (df["ROC_9_1h"] < 40.0) | (df["ROC_9_4h"] < 40.0))
             # 15m down move, 4h & 1d overbought
             & ((df["RSI_3_15m"] > 25.0) | (df["ROC_9_4h"] < 10.0) | (df["ROC_9_1d"] < 50.0))
             # 15m & 4h down move, 4h high
@@ -16252,6 +16187,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_1h"] < 100.0) | (df["ROC_9_4h"] < 15.0))
             # 15m down move, 1h high, 1d overbought
             & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_1h"] < 100.0) | (df["ROC_9_1d"] < 20.0))
+            # 15m down move, 4h high & overbought
+            & ((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_4h"] < 100.0) | (df["ROC_9_4h"] < 10.0))
             # 15m down move, 1h & 4h high
             & ((df["RSI_3_15m"] > 30.0) | (df["AROONU_14_1h"] < 90.0) | (df["AROONU_14_4h"] < 90.0))
             # 1h & 4h down move, 1d still high
@@ -17231,6 +17168,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3"] > 3.0) | (df["AROONU_14_1h"] < 80.0) | (df["AROONU_14_4h"] < 100.0))
             # 5m down move, 4h high & overbought
             & ((df["RSI_3"] > 3.0) | (df["AROONU_14_4h"] < 100.0) | (df["ROC_9_4h"] < 20.0))
+            # 5m down move, 1h high, 4h overbought
+            & ((df["RSI_3"] > 3.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 5m down move, 1d high & overbought
             & ((df["RSI_3"] > 3.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 90.0) | (df["ROC_9_1d"] < 20.0))
             # 5m & 1h down move, 1d overbought
@@ -17456,7 +17395,9 @@ class NostalgiaForInfinityX7(IStrategy):
             # 15m down move, 1d high & overbought
             & ((df["RSI_3_15m"] > 30.0) | (df["AROONU_14_1d"] < 100.0) | (df["ROC_9_1d"] < 50.0))
             # 1h & 4h down move, 1d still high
-            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 50.0))
+            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 40.0))
+            # 1h & 4h down move, 4h still high
+            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 15.0) | (df["AROONU_14_4h"] < 40.0))
             # 1h & 4h down move, 1d still high
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 15.0) | (df["AROONU_14_1d"] < 40.0))
             # 1h & 4h down move, 1d high
@@ -17589,6 +17530,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_1h"] > 40.0) | (df["AROONU_14_4h"] < 80.0) | (df["ROC_9_1d"] < 40.0))
             # 1h down move, 4h high & overbought
             & ((df["RSI_3_1h"] > 40.0) | (df["AROONU_14_4h"] < 90.0) | (df["ROC_9_4h"] < 20.0))
+            # 1h down move, 1h high, 4h overbought
+            & ((df["RSI_3_1h"] > 40.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 1h down move, 4h high & overbought
             & ((df["RSI_3_1h"] > 40.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 1h down move, 1d high, 4h overbought
@@ -18105,8 +18048,6 @@ class NostalgiaForInfinityX7(IStrategy):
           )
           # 15m down move, 4h high, 1h overbought
           long_entry_logic.append((df["RSI_3_15m"] > 10.0) | (df["AROONU_14_4h"] < 100.0) | (df["ROC_9_1h"] < 10.0))
-          # 15m down move, 4h high & overbought
-          long_entry_logic.append((df["RSI_3_15m"] > 10.0) | (df["AROONU_14_4h"] < 100.0) | (df["ROC_9_4h"] < 20.0))
           # 15m & 1h down move, 4h high
           long_entry_logic.append((df["RSI_3_15m"] > 15.0) | (df["RSI_3_1h"] > 15.0) | (df["AROONU_14_4h"] < 70.0))
           # 15m down move, 1h & 4h high
@@ -18117,6 +18058,8 @@ class NostalgiaForInfinityX7(IStrategy):
           long_entry_logic.append((df["RSI_3_15m"] > 15.0) | (df["AROONU_14_4h"] < 70.0) | (df["ROC_9_1d"] < 50.0))
           # 15m & 1h down move, 1d overbought
           long_entry_logic.append((df["RSI_3_15m"] > 25.0) | (df["RSI_3_1h"] > 40.0) | (df["ROC_9_1d"] < 80.0))
+          # 15m down move, 4h high & overbought
+          long_entry_logic.append((df["RSI_3_15m"] > 25.0) | (df["AROONU_14_4h"] < 100.0) | (df["ROC_9_4h"] < 10.0))
           # 15m & 1h down move, 1h high
           long_entry_logic.append((df["RSI_3_15m"] > 30.0) | (df["RSI_3_1h"] > 30.0) | (df["AROONU_14_1h"] < 70.0))
           # 1h down move, 4h still not low enough
@@ -18601,6 +18544,8 @@ class NostalgiaForInfinityX7(IStrategy):
           long_entry_logic.append(
             (df["RSI_3_4h"] > 35.0) | (df["AROONU_14_4h"] < 60.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 90.0)
           )
+          # 4h down move, 1d high, 4h overbought
+          long_entry_logic.append((df["RSI_3_4h"] > 45.0) | (df["AROONU_14_1d"] < 100.0) | (df["ROC_9_4h"] < 10.0))
           # 4h down move, 4h overbought
           long_entry_logic.append((df["RSI_3_4h"] > 60.0) | (df["ROC_9_4h"] < 40.0))
           # 1d down move, 4h & 1d downtrend
@@ -18824,6 +18769,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 5.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 20.0))
             # 1h & 4h down move, 15m stil high
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_15m"] < 50.0))
+            # 1h & 4h down move, 1d still high
+            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 40.0))
             # 1h down move, 1h still not low enough
             & ((df["RSI_3_1h"] > 3.0) | (df["AROONU_14_1h"] < 20.0))
             # 1h & 4h down move, 1d downtrend
@@ -19123,6 +19070,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 30.0) | (df["RSI_3_4h"] > 35.0) | (df["AROONU_14_4h"] < 70.0))
             # 15m down move, 15m still high, 4h high
             & ((df["RSI_3_15m"] > 35.0) | (df["AROONU_14_15m"] < 50.0) | (df["AROONU_14_4h"] < 80.0))
+            # 1h & 4h down move, 1d still high
+            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 40.0))
             # 1h & 4h down move, 4h still high
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 40.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 50.0))
             # 1h & 4h down move, 4h high
@@ -19381,6 +19330,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3"] > 3.0) | (df["RSI_3_1h"] > 10.0) | (df["AROONU_14_1h"] < 30.0))
             # 5m & 1d down move, 1d downtrend
             & ((df["RSI_3"] > 3.0) | (df["RSI_3_1d"] > 15.0) | (df["CMF_20_1d"] > -0.25))
+            # 5m down move, 1h high, 4h overbought
+            & ((df["RSI_3"] > 3.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 5m down move, 1d high & overbought
             & ((df["RSI_3"] > 3.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 90.0) | (df["ROC_9_1d"] < 20.0))
             # 15m & 1h down move, 1h still not low enough
@@ -19507,6 +19458,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 3.0) | (df["ROC_9_15m"] > -30.0))
             # 1h & 4h down move, 4h still high
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 40.0))
+            # 1h & 4h down move, 1d still high
+            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 40.0))
             # 1h & 4h down move, 4h stil high
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 20.0) | (df["RSI_14_4h"] < 40.0))
             # 1h ^ 4h down move, 1d downtrend
@@ -19677,6 +19630,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_1h"] > 40.0) | (df["AROONU_14_15m"] < 60.0) | (df["AROONU_14_1h"] < 70.0))
             # 1h down move, 1h high, 1d overbought
             & ((df["RSI_3_1h"] > 40.0) | (df["AROONU_14_1h"] < 80.0) | (df["ROC_9_1d"] < 80.0))
+            # 1h down move, 1h high, 4h overbought
+            & ((df["RSI_3_1h"] > 40.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_4h"] < 20.0))
             # 1h down move, 1h & 4h overbought
             & ((df["RSI_3_1h"] > 40.0) | (df["ROC_9_1h"] < 10.0) | (df["ROC_9_4h"] < 10.0))
             # 1h & 4h down move, 1d overbought
@@ -21653,6 +21608,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 35.0) | (df["AROONU_14_15m"] < 70.0) | (df["AROONU_14_4h"] < 90.0))
             # 1h & 4h down move, 4h still not low enough
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 10.0))
+            # 1h & 4h down move, 1d still high
+            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 40.0))
             # 1h & 4h down move, 1d overbought
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 25.0) | (df["ROC_9_1d"] < 10.0))
             # 1h & 1d down move, 1d still high
@@ -21871,6 +21828,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["AROONU_14_4h"] < 100.0) | (df["AROONU_14_1d"] < 100.0) | (df["ROC_9_4h"] < 50.0))
             # 4h & 1d high, 1d overbought
             & ((df["AROONU_14_4h"] < 90.0) | (df["AROONU_14_1d"] < 100.0) | (df["ROC_9_1d"] < 50.0))
+            # 1h high, 1h & 4h overbought
+            & ((df["STOCHRSIk_14_14_3_3_1h"] < 80.0) | (df["ROC_9_1h"] < 20.0) | (df["ROC_9_4h"] < 20.0))
             # 4h & 1d overbought
             & ((df["ROC_9_4h"] < 100.0) | (df["ROC_9_1d"] < 200.0))
           )
@@ -22025,8 +21984,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 15.0) | (df["AROONU_14_15m"] < 70.0) | (df["ROC_9_1d"] < 10.0))
             # 15m down move, 1h & 4h high
             & ((df["RSI_3_15m"] > 15.0) | (df["AROONU_14_1h"] < 100.0) | (df["AROONU_14_4h"] < 100.0))
-            # 15m down move, 15m high, 1d overbought
-            & ((df["RSI_3_15m"] > 15.0) | (df["AROONU_14_15m"] < 70.0) | (df["ROC_9_1d"] < 50.0))
+            # 15m down move, 1d high & overbought
+            & ((df["RSI_3_15m"] > 15.0) | (df["AROONU_14_1d"] < 100.0) | (df["ROC_9_1d"] < 80.0))
             # 15m & 1h down move, 1h high
             & ((df["RSI_3_15m"] > 20.0) | (df["RSI_3_1h"] > 20.0) | (df["STOCHRSIk_14_14_3_3_1h"] < 60.0))
             # 15m & 4h down move, 15m high
@@ -22587,6 +22546,8 @@ class NostalgiaForInfinityX7(IStrategy):
             & ((df["RSI_3_15m"] > 35.0) | (df["AROONU_14_15m"] < 70.0) | (df["AROONU_14_4h"] < 90.0))
             # 1h & 4h down move, 1h downtrend
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["CMF_20_1h"] > -0.20))
+            # 1h & 4h down move, 1d still high
+            & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 10.0) | (df["STOCHRSIk_14_14_3_3_1d"] < 40.0))
             # 1h & 4h down move, 4h still high
             & ((df["RSI_3_1h"] > 3.0) | (df["RSI_3_4h"] > 20.0) | (df["STOCHRSIk_14_14_3_3_4h"] < 40.0))
             # 1h & 4h down move, 15m still high
@@ -24063,9 +24024,9 @@ class NostalgiaForInfinityX7(IStrategy):
     #
 
     for enabled_short_entry_signal in self.short_entry_signal_params:
-      short_entry_condition_index = int(enabled_short_entry_signal.split("_")[3])
+      short_entry_condition_index = int(enabled_short_entry_signal.rsplit("_", 2)[1])
       item_short_buy_protection_list = [True]
-      if self.short_entry_signal_params[f"{enabled_short_entry_signal}"]:
+      if self.short_entry_signal_params[enabled_short_entry_signal]:
         # Short Entry Conditions Starts Here
         # -----------------------------------------------------------------------------------------
         # IMPORTANT: Short Condition Descriptions are not for shorts. These are for longs but completely mirrored opposite side
@@ -26026,6 +25987,7 @@ class NostalgiaForInfinityX7(IStrategy):
     profit_init_ratio: float,
     max_profit: float,
     max_loss: float,
+    filled_orders,
     filled_entries,
     filled_exits,
     last_candle,
@@ -26165,7 +26127,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.long_normal_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.long_normal_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.005):
           mark_pair, mark_signal = self.mark_profit_target(
             self.long_normal_mode_name,
@@ -26182,7 +26144,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.long_normal_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.long_normal_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -26297,85 +26259,54 @@ class NostalgiaForInfinityX7(IStrategy):
     current_time: "datetime",
     enter_tags,
   ) -> tuple:
-    sell = False
+    mode_name = self.long_pump_mode_name
 
-    # if the profit is negative skip checking these
+    sell = False
+    signal_name = None
+
+    stoploss_doom = f"exit_{mode_name}_stoploss_doom"
+    stoploss_ue = f"exit_{mode_name}_stoploss_u_e"
+    max_signal = f"exit_profit_{mode_name}_max"
+
+    candle_args = (
+      last_candle,
+      previous_candle_1,
+      previous_candle_2,
+      previous_candle_3,
+      previous_candle_4,
+      previous_candle_5,
+    )
+
+    common_args = (
+      mode_name,
+      profit_init_ratio,
+      max_profit,
+      max_loss,
+      *candle_args,
+      trade,
+      current_time,
+      enter_tags,
+    )
+
+    # Profit-based exits
     if profit_init_ratio > 0.0:
-      # Original sell signals
-      sell, signal_name = self.long_exit_signals(
-        self.long_pump_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
+      exit_checks = (
+        self.long_exit_signals,
+        self.long_exit_main,
+        self.long_exit_williams_r,
+        self.long_exit_dec,
       )
 
-      # Main sell signals
-      if not sell:
-        sell, signal_name = self.long_exit_main(
-          self.long_pump_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
+      for exit_check in exit_checks:
+        sell, signal_name = exit_check(*common_args)
 
-      # Williams %R based sells
-      if not sell:
-        sell, signal_name = self.long_exit_williams_r(
-          self.long_pump_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
+        if sell:
+          break
 
-      # Downtrend/descending based sells
-      if not sell:
-        sell, signal_name = self.long_exit_dec(
-          self.long_pump_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
-
-    # Stoplosses
+    # Stoploss exits
     if not sell:
       sell, signal_name = self.long_exit_stoploss(
-        self.long_pump_mode_name,
+        mode_name,
         current_rate,
         profit_stake,
         profit_ratio,
@@ -26385,27 +26316,27 @@ class NostalgiaForInfinityX7(IStrategy):
         max_loss,
         filled_entries,
         filled_exits,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
+        *candle_args,
         trade,
         current_time,
         enter_tags,
       )
 
-    # Profit Target Signal
-    # Check if pair exist on target_profit_cache
-    if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-      previous_rate = self.target_profit_cache.data[pair]["rate"]
-      previous_profit = self.target_profit_cache.data[pair]["profit"]
-      previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      previous_time_profit_reached = datetime.fromisoformat(self.target_profit_cache.data[pair]["time_profit_reached"])
+    # Cached target profit data
+    cache = self.target_profit_cache
+    cache_data = cache.data if cache is not None else None
+    target_data = cache_data.get(pair) if cache_data else None
+
+    # Profit target logic
+    if target_data:
+      previous_rate = target_data["rate"]
+      previous_profit = target_data["profit"]
+      previous_sell_reason = target_data["sell_reason"]
+
+      previous_time_profit_reached = datetime.fromisoformat(target_data["time_profit_reached"])
 
       sell_max, signal_name_max = self.exit_profit_target(
-        self.long_pump_mode_name,
+        mode_name,
         pair,
         trade,
         current_time,
@@ -26422,12 +26353,14 @@ class NostalgiaForInfinityX7(IStrategy):
         previous_time_profit_reached,
         enter_tags,
       )
+
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.long_pump_mode_name}_stoploss_u_e"]:
+
+      if previous_sell_reason == stoploss_ue:
         if profit_ratio > (previous_profit + 0.005):
           mark_pair, mark_signal = self.mark_profit_target(
-            self.long_pump_mode_name,
+            mode_name,
             pair,
             True,
             previous_sell_reason,
@@ -26438,14 +26371,19 @@ class NostalgiaForInfinityX7(IStrategy):
             last_candle,
             previous_candle_1,
           )
+
           if mark_pair:
-            self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
-      elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.long_pump_mode_name}_stoploss_doom"]
-      ):
-        # Update the target, raise it.
+            self._set_profit_target(
+              pair,
+              mark_signal,
+              current_rate,
+              profit_ratio,
+              current_time,
+            )
+
+      elif profit_init_ratio > (previous_profit + 0.001) and previous_sell_reason != stoploss_doom:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_pump_mode_name,
+          mode_name,
           pair,
           True,
           previous_sell_reason,
@@ -26456,20 +26394,23 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
-        if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
 
-    # Add the pair to the list, if a sell triggered and conditions met
+        if mark_pair:
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
+
+    # Sell triggered
     if sell and signal_name is not None:
-      previous_profit = None
-      if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-        previous_profit = self.target_profit_cache.data[pair]["profit"]
-      if signal_name in [
-        f"exit_{self.long_pump_mode_name}_stoploss_doom",
-        f"exit_{self.long_pump_mode_name}_stoploss_u_e",
-      ]:
+      previous_profit = target_data["profit"] if target_data else None
+
+      if signal_name in (stoploss_doom, stoploss_ue):
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_pump_mode_name,
+          mode_name,
           pair,
           sell,
           signal_name,
@@ -26480,14 +26421,22 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_ratio,
+            current_time,
+          )
+
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
-      elif (previous_profit is None) or (previous_profit < profit_init_ratio):
+          return True, signal_name
+
+      elif previous_profit is None or previous_profit < profit_init_ratio:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_pump_mode_name,
+          mode_name,
           pair,
           sell,
           signal_name,
@@ -26498,29 +26447,35 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
+
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
-    else:
-      if profit_init_ratio >= 0.005:
-        previous_profit = None
-        if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-          previous_profit = self.target_profit_cache.data[pair]["profit"]
-        if (previous_profit is None) or (previous_profit < profit_init_ratio):
-          mark_signal = f"exit_profit_{self.long_pump_mode_name}_max"
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          return True, signal_name
 
-    if signal_name not in [
-      f"exit_profit_{self.long_pump_mode_name}_max",
-      f"exit_{self.long_pump_mode_name}_stoploss_doom",
-      f"exit_{self.long_pump_mode_name}_stoploss_u_e",
-    ]:
-      if sell and (signal_name is not None):
-        return True, f"{signal_name}"
+    # Update cached max profit
+    elif profit_init_ratio >= 0.005:
+      previous_profit = target_data["profit"] if target_data else None
 
-    #  Here ends exit signal conditions for long_exit_pump
+      if previous_profit is None or previous_profit < profit_init_ratio:
+        self._set_profit_target(
+          pair,
+          max_signal,
+          current_rate,
+          profit_init_ratio,
+          current_time,
+        )
+
+    # Final sell validation
+    if sell and signal_name is not None and signal_name not in (max_signal, stoploss_doom, stoploss_ue):
+      return True, signal_name
 
     return False, None
 
@@ -26548,85 +26503,58 @@ class NostalgiaForInfinityX7(IStrategy):
     current_time: "datetime",
     enter_tags,
   ) -> tuple:
-    sell = False
+    mode_name = self.long_quick_mode_name
 
-    # if the profit is negative skip checking these
+    sell = False
+    signal_name = None
+
+    stoploss_doom = f"exit_{mode_name}_stoploss_doom"
+    stoploss_ue = f"exit_{mode_name}_stoploss_u_e"
+    profit_max_signal = f"exit_profit_{mode_name}_max"
+
+    candle_args = (
+      last_candle,
+      previous_candle_1,
+      previous_candle_2,
+      previous_candle_3,
+      previous_candle_4,
+      previous_candle_5,
+    )
+
+    common_args = (
+      mode_name,
+      profit_init_ratio,
+      max_profit,
+      max_loss,
+      *candle_args,
+      trade,
+      current_time,
+      enter_tags,
+    )
+
+    # -------------------------------------------------------------------------
+    # Profit-based exit signals
+    # -------------------------------------------------------------------------
     if profit_init_ratio > 0.0:
-      # Original sell signals
-      sell, signal_name = self.long_exit_signals(
-        self.long_quick_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
+      exit_checks = (
+        self.long_exit_signals,
+        self.long_exit_main,
+        self.long_exit_williams_r,
+        self.long_exit_dec,
       )
 
-      # Main sell signals
-      if not sell:
-        sell, signal_name = self.long_exit_main(
-          self.long_quick_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
+      for exit_check in exit_checks:
+        sell, signal_name = exit_check(*common_args)
 
-      # Williams %R based sells
-      if not sell:
-        sell, signal_name = self.long_exit_williams_r(
-          self.long_quick_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
+        if sell:
+          break
 
-      # Downtrend/descending based sells
-      if not sell:
-        sell, signal_name = self.long_exit_dec(
-          self.long_quick_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
-
-    # Stoplosses
+    # -------------------------------------------------------------------------
+    # Stoploss
+    # -------------------------------------------------------------------------
     if not sell:
       sell, signal_name = self.long_exit_stoploss(
-        self.long_quick_mode_name,
+        mode_name,
         current_rate,
         profit_stake,
         profit_ratio,
@@ -26636,58 +26564,63 @@ class NostalgiaForInfinityX7(IStrategy):
         max_loss,
         filled_entries,
         filled_exits,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
+        *candle_args,
         trade,
         current_time,
         enter_tags,
       )
 
-    # Extra sell logic
-    if not sell:
-      if (0.09 >= profit_init_ratio > 0.02) and (last_candle["RSI_14"] > 78.0):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_1"
+    # -------------------------------------------------------------------------
+    # Extra quick exit logic
+    # -------------------------------------------------------------------------
+    if not sell and 0.02 < profit_init_ratio <= 0.09:
+      rsi_14 = last_candle["RSI_14"]
+      mfi_14 = last_candle["MFI_14"]
+      willr_14 = last_candle["WILLR_14"]
+      rsi_3 = last_candle["RSI_3"]
+      rsi_3_15m = last_candle["RSI_3_15m"]
 
-      elif (0.09 >= profit_init_ratio > 0.02) and (last_candle["MFI_14"] > 84.0):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_2"
+      quick_conditions = (
+        (rsi_14 > 78.0, "q_1"),
+        (mfi_14 > 84.0, "q_2"),
+        (willr_14 >= -0.1, "q_3"),
+        (
+          rsi_14 >= 72.0 and rsi_3 > 90.0 and rsi_3_15m > 90.0,
+          "q_4",
+        ),
+        (rsi_3_15m > 96.0, "q_5"),
+        (rsi_3 > 85.0 and rsi_3_15m > 85.0, "q_6"),
+        (rsi_3 > 90.0 and rsi_3_15m > 80.0, "q_7"),
+        (rsi_3 > 92.0 and rsi_3_15m > 75.0, "q_8"),
+        (rsi_3 > 94.0 and rsi_3_15m > 70.0, "q_9"),
+        (rsi_3 > 99.0, "q_10"),
+      )
 
-      elif (0.09 >= profit_init_ratio > 0.02) and (last_candle["WILLR_14"] >= -0.1):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_3"
+      for condition, suffix in quick_conditions:
+        if condition:
+          sell = True
+          signal_name = f"exit_{mode_name}_{suffix}"
+          break
 
-      elif (
-        (0.09 >= profit_init_ratio > 0.02)
-        and (last_candle["RSI_14"] >= 72.0)
-        and (last_candle["RSI_3"] > 90.0)
-        and (last_candle["RSI_3_15m"] > 90.0)
-      ):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_4"
-      elif (0.09 >= profit_init_ratio > 0.02) and (last_candle["RSI_3_15m"] > 96.0):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_5"
-      elif (0.09 >= profit_init_ratio > 0.02) and (last_candle["RSI_3"] > 85.0) and (last_candle["RSI_3_15m"] > 85.0):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_6"
-      elif (0.09 >= profit_init_ratio > 0.02) and (last_candle["RSI_3"] > 90.0) and (last_candle["RSI_3_15m"] > 80.0):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_7"
-      elif (0.09 >= profit_init_ratio > 0.02) and (last_candle["RSI_3"] > 92.0) and (last_candle["RSI_3_15m"] > 75.0):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_8"
-      elif (0.09 >= profit_init_ratio > 0.02) and (last_candle["RSI_3"] > 94.0) and (last_candle["RSI_3_15m"] > 70.0):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_9"
-      elif (0.09 >= profit_init_ratio > 0.02) and (last_candle["RSI_3"] > 99.0):
-        sell, signal_name = True, f"exit_{self.long_quick_mode_name}_q_10"
+    # -------------------------------------------------------------------------
+    # Cached target data
+    # -------------------------------------------------------------------------
+    cache = self.target_profit_cache
+    cache_data = cache.data if cache is not None else None
+    target_data = cache_data.get(pair) if cache_data else None
 
-    # Profit Target Signal
-    # Check if pair exist on target_profit_cache
-    if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-      previous_rate = self.target_profit_cache.data[pair]["rate"]
-      previous_profit = self.target_profit_cache.data[pair]["profit"]
-      previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      previous_time_profit_reached = datetime.fromisoformat(self.target_profit_cache.data[pair]["time_profit_reached"])
+    # -------------------------------------------------------------------------
+    # Profit target logic
+    # -------------------------------------------------------------------------
+    if target_data:
+      previous_rate = target_data["rate"]
+      previous_profit = target_data["profit"]
+      previous_sell_reason = target_data["sell_reason"]
+
+      previous_time_profit_reached = datetime.fromisoformat(target_data["time_profit_reached"])
 
       sell_max, signal_name_max = self.exit_profit_target(
-        self.long_quick_mode_name,
+        mode_name,
         pair,
         trade,
         current_time,
@@ -26704,12 +26637,14 @@ class NostalgiaForInfinityX7(IStrategy):
         previous_time_profit_reached,
         enter_tags,
       )
+
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.long_quick_mode_name}_stoploss_u_e"]:
+
+      if previous_sell_reason == stoploss_ue:
         if profit_ratio > (previous_profit + 0.001):
           mark_pair, mark_signal = self.mark_profit_target(
-            self.long_quick_mode_name,
+            mode_name,
             pair,
             True,
             previous_sell_reason,
@@ -26720,14 +26655,19 @@ class NostalgiaForInfinityX7(IStrategy):
             last_candle,
             previous_candle_1,
           )
+
           if mark_pair:
-            self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
-      elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.long_quick_mode_name}_stoploss_doom"]
-      ):
-        # Update the target, raise it.
+            self._set_profit_target(
+              pair,
+              mark_signal,
+              current_rate,
+              profit_ratio,
+              current_time,
+            )
+
+      elif profit_init_ratio > (previous_profit + 0.001) and previous_sell_reason != stoploss_doom:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_quick_mode_name,
+          mode_name,
           pair,
           True,
           previous_sell_reason,
@@ -26738,28 +26678,29 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
-        if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
 
-    # Add the pair to the list, if a sell triggered and conditions met
+        if mark_pair:
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
+
+    # -------------------------------------------------------------------------
+    # Sell triggered logic
+    # -------------------------------------------------------------------------
     if sell and signal_name is not None:
-      previous_profit = None
-      previous_sell_reason = ""
-      if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-        previous_profit = self.target_profit_cache.data[pair]["profit"]
-        previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      if signal_name in [
-        f"exit_{self.long_quick_mode_name}_stoploss_doom",
-        f"exit_{self.long_quick_mode_name}_stoploss_u_e",
-      ] and (
-        previous_sell_reason
-        not in [
-          f"exit_{self.long_quick_mode_name}_stoploss_doom",
-          f"exit_profit_{self.long_quick_mode_name}_stoploss_u_e",
-        ]
+      previous_profit = target_data["profit"] if target_data else None
+      previous_sell_reason = target_data["sell_reason"] if target_data else ""
+
+      if signal_name in (stoploss_doom, stoploss_ue) and previous_sell_reason not in (
+        stoploss_doom,
+        f"exit_profit_{mode_name}_stoploss_u_e",
       ):
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_quick_mode_name,
+          mode_name,
           pair,
           sell,
           signal_name,
@@ -26770,14 +26711,22 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_ratio,
+            current_time,
+          )
+
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
-      elif (previous_profit is None) or (previous_profit < profit_init_ratio):
+          return True, signal_name
+
+      elif previous_profit is None or previous_profit < profit_init_ratio:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_quick_mode_name,
+          mode_name,
           pair,
           sell,
           signal_name,
@@ -26788,29 +26737,48 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
+
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
-    else:
-      if profit_init_ratio >= 0.005:
-        previous_profit = None
-        if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-          previous_profit = self.target_profit_cache.data[pair]["profit"]
-        if (previous_profit is None) or (previous_profit < profit_init_ratio):
-          mark_signal = f"exit_profit_{self.long_quick_mode_name}_max"
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          return True, signal_name
 
-    if signal_name not in [
-      f"exit_profit_{self.long_quick_mode_name}_max",
-      f"exit_{self.long_quick_mode_name}_stoploss_doom",
-      f"exit_{self.long_quick_mode_name}_stoploss_u_e",
-    ]:
-      if sell and (signal_name is not None):
-        return True, f"{signal_name}"
+    # -------------------------------------------------------------------------
+    # Update max cached profit
+    # -------------------------------------------------------------------------
+    elif profit_init_ratio >= 0.005:
+      previous_profit = target_data["profit"] if target_data else None
 
-    #  Here ends exit signal conditions for long_exit_quick
+      if previous_profit is None or previous_profit < profit_init_ratio:
+        self._set_profit_target(
+          pair,
+          profit_max_signal,
+          current_rate,
+          profit_init_ratio,
+          current_time,
+        )
+
+    # -------------------------------------------------------------------------
+    # Final sell validation
+    # -------------------------------------------------------------------------
+    if (
+      sell
+      and signal_name is not None
+      and signal_name
+      not in (
+        profit_max_signal,
+        stoploss_doom,
+        stoploss_ue,
+      )
+    ):
+      return True, signal_name
 
     return False, None
 
@@ -26838,15 +26806,16 @@ class NostalgiaForInfinityX7(IStrategy):
     current_time: "datetime",
     enter_tags,
   ) -> tuple:
-    is_backtest = self.is_backtest_mode()
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
-    sell = False
+    mode_name = self.long_rebuy_mode_name
+    stoploss_doom = f"exit_{mode_name}_stoploss_doom"
+    stoploss_u_e = f"exit_{mode_name}_stoploss_u_e"
+    profit_max = f"exit_profit_{mode_name}_max"
 
-    # Original sell signals
-    sell, signal_name = self.long_exit_signals(
-      self.long_rebuy_mode_name,
+    sell = False
+    signal_name = None
+
+    signal_args = (
+      mode_name,
       profit_current_stake_ratio,
       max_profit,
       max_loss,
@@ -26861,121 +26830,76 @@ class NostalgiaForInfinityX7(IStrategy):
       enter_tags,
     )
 
-    # Main sell signals
-    if not sell:
-      sell, signal_name = self.long_exit_main(
-        self.long_rebuy_mode_name,
-        profit_current_stake_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+    # Original sell signals
+    for exit_func in (
+      self.long_exit_signals,
+      self.long_exit_main,
+      self.long_exit_williams_r,
+      self.long_exit_dec,
+    ):
+      sell, signal_name = exit_func(*signal_args)
 
-    # Williams %R based sells
-    if not sell:
-      sell, signal_name = self.long_exit_williams_r(
-        self.long_rebuy_mode_name,
-        profit_current_stake_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
-
-    # Downtrend/descending based sells
-    if not sell:
-      sell, signal_name = self.long_exit_dec(
-        self.long_rebuy_mode_name,
-        profit_current_stake_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+      if sell:
+        break
 
     # Stoplosses
     if not sell:
+      leverage = trade.leverage
+      entry_cost = filled_entries[0].cost
+
+      is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
+
       if is_system_v3_2:
-        if self.system_v3_2_stops_enable and (
-          profit_stake
-          < -(
-            filled_entries[0].cost
-            * (
-              self.system_v3_2_stop_threshold_futures_rebuy
-              if self.is_futures_mode
-              else self.system_v3_2_stop_threshold_spot_rebuy
-            )
-            / trade.leverage
-          )
-        ):
-          sell, signal_name = True, f"exit_{self.long_rebuy_mode_name}_stoploss_doom"
+        threshold = (
+          self.system_v3_2_stop_threshold_futures_rebuy
+          if self.is_futures_mode
+          else self.system_v3_2_stop_threshold_spot_rebuy
+        )
+
+        if self.system_v3_2_stops_enable and profit_stake < -(entry_cost * threshold / leverage):
+          sell, signal_name = True, stoploss_doom
+
       elif is_system_v3_1:
-        if profit_stake < -(
-          filled_entries[0].cost
-          * (
-            self.system_v3_1_stop_threshold_futures_rebuy
-            if self.is_futures_mode
-            else self.system_v3_1_stop_threshold_spot_rebuy
-          )
-          / trade.leverage
-        ):
-          sell, signal_name = True, f"exit_{self.long_rebuy_mode_name}_stoploss_doom"
+        threshold = (
+          self.system_v3_1_stop_threshold_futures_rebuy
+          if self.is_futures_mode
+          else self.system_v3_1_stop_threshold_spot_rebuy
+        )
+
+        if profit_stake < -(entry_cost * threshold / leverage):
+          sell, signal_name = True, stoploss_doom
+
       elif is_system_v3:
-        if profit_stake < -(
-          filled_entries[0].cost
-          * (
-            self.system_v3_stop_threshold_futures_rebuy
-            if self.is_futures_mode
-            else self.system_v3_stop_threshold_spot_rebuy
-          )
-          / trade.leverage
-        ):
-          sell, signal_name = True, f"exit_{self.long_rebuy_mode_name}_stoploss_doom"
+        threshold = (
+          self.system_v3_stop_threshold_futures_rebuy
+          if self.is_futures_mode
+          else self.system_v3_stop_threshold_spot_rebuy
+        )
+
+        if profit_stake < -(entry_cost * threshold / leverage):
+          sell, signal_name = True, stoploss_doom
+
       else:
-        if (
-          profit_stake
-          < -(
-            filled_entries[0].cost
-            * (self.stop_threshold_futures_rebuy if self.is_futures_mode else self.stop_threshold_spot_rebuy)
-            / trade.leverage
-          )
-          # temporary
-          and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+        threshold = self.stop_threshold_futures_rebuy if self.is_futures_mode else self.stop_threshold_spot_rebuy
+
+        if profit_stake < -(entry_cost * threshold / leverage) and (
+          trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or self.is_backtest_mode()
         ):
-          sell, signal_name = True, f"exit_{self.long_rebuy_mode_name}_stoploss_doom"
+          sell, signal_name = True, stoploss_doom
 
     # Profit Target Signal
-    # Check if pair exist on target_profit_cache
-    if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-      previous_rate = self.target_profit_cache.data[pair]["rate"]
-      previous_profit = self.target_profit_cache.data[pair]["profit"]
-      previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      previous_time_profit_reached = datetime.fromisoformat(self.target_profit_cache.data[pair]["time_profit_reached"])
+    cache = self.target_profit_cache
+    cache_data = cache.data if cache is not None else None
+    target_data = cache_data.get(pair) if cache_data else None
+
+    if target_data:
+      previous_rate = target_data["rate"]
+      previous_profit = target_data["profit"]
+      previous_sell_reason = target_data["sell_reason"]
+      previous_time_profit_reached = datetime.fromisoformat(target_data["time_profit_reached"])
 
       sell_max, signal_name_max = self.exit_profit_target(
-        self.long_rebuy_mode_name,
+        mode_name,
         pair,
         trade,
         current_time,
@@ -26992,12 +26916,14 @@ class NostalgiaForInfinityX7(IStrategy):
         previous_time_profit_reached,
         enter_tags,
       )
+
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.long_rebuy_mode_name}_stoploss_u_e"]:
+
+      if previous_sell_reason == stoploss_u_e:
         if profit_ratio > (previous_profit + 0.001):
           mark_pair, mark_signal = self.mark_profit_target(
-            self.long_rebuy_mode_name,
+            mode_name,
             pair,
             True,
             previous_sell_reason,
@@ -27008,14 +26934,19 @@ class NostalgiaForInfinityX7(IStrategy):
             last_candle,
             previous_candle_1,
           )
+
           if mark_pair:
-            self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
-      elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.long_rebuy_mode_name}_stoploss_doom"]
-      ):
-        # Update the target, raise it.
+            self._set_profit_target(
+              pair,
+              mark_signal,
+              current_rate,
+              profit_ratio,
+              current_time,
+            )
+
+      elif profit_init_ratio > (previous_profit + 0.001) and previous_sell_reason != stoploss_doom:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_rebuy_mode_name,
+          mode_name,
           pair,
           True,
           previous_sell_reason,
@@ -27026,20 +26957,23 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
 
     # Add the pair to the list, if a sell triggered and conditions met
     if sell and signal_name is not None:
-      previous_profit = None
-      if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-        previous_profit = self.target_profit_cache.data[pair]["profit"]
-      if signal_name in [
-        f"exit_{self.long_rebuy_mode_name}_stoploss_doom",
-        f"exit_{self.long_rebuy_mode_name}_stoploss_u_e",
-      ]:
+      previous_profit = target_data["profit"] if target_data else None
+
+      if signal_name in (stoploss_doom, stoploss_u_e):
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_rebuy_mode_name,
+          mode_name,
           pair,
           sell,
           signal_name,
@@ -27050,14 +26984,21 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_ratio,
+            current_time,
+          )
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
+          return True, signal_name
+
       elif (previous_profit is None) or (previous_profit < profit_init_ratio):
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_rebuy_mode_name,
+          mode_name,
           pair,
           sell,
           signal_name,
@@ -27068,30 +27009,40 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
+          return True, signal_name
+
     else:
       if profit_init_ratio >= 0.005:
-        previous_profit = None
-        if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-          previous_profit = self.target_profit_cache.data[pair]["profit"]
+        previous_profit = target_data["profit"] if target_data else None
+
         if (previous_profit is None) or (previous_profit < profit_init_ratio):
-          mark_signal = f"exit_profit_{self.long_rebuy_mode_name}_max"
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            profit_max,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
 
-    if signal_name not in [
-      f"exit_profit_{self.long_rebuy_mode_name}_max",
-      f"exit_{self.long_rebuy_mode_name}_stoploss_doom",
-      f"exit_{self.long_rebuy_mode_name}_stoploss_u_e",
-    ]:
-      if sell and (signal_name is not None):
-        return True, f"{signal_name}"
+    if signal_name not in (
+      profit_max,
+      stoploss_doom,
+      stoploss_u_e,
+    ):
+      if sell and signal_name is not None:
+        return True, signal_name
 
-    #  Here ends exit signal conditions for long_exit_rebuy
-
+    # Here ends exit signal conditions for long_exit_rebuy
     return False, None
 
   # Long Exit High Profit
@@ -27118,11 +27069,17 @@ class NostalgiaForInfinityX7(IStrategy):
     current_time: "datetime",
     enter_tags,
   ) -> tuple:
-    sell = False
+    mode_name = self.long_high_profit_mode_name
 
-    # Original sell signals
-    sell, signal_name = self.long_exit_signals(
-      self.long_high_profit_mode_name,
+    stoploss_doom = f"exit_{mode_name}_stoploss_doom"
+    stoploss_u_e = f"exit_{mode_name}_stoploss_u_e"
+    profit_max = f"exit_profit_{mode_name}_max"
+
+    sell = False
+    signal_name = None
+
+    signal_args = (
+      mode_name,
       profit_init_ratio,
       max_profit,
       max_loss,
@@ -27137,46 +27094,21 @@ class NostalgiaForInfinityX7(IStrategy):
       enter_tags,
     )
 
-    # Main sell signals
-    if not sell:
-      sell, signal_name = self.long_exit_main(
-        self.long_high_profit_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+    # Original/Main/Williams sells
+    for exit_func in (
+      self.long_exit_signals,
+      self.long_exit_main,
+      self.long_exit_williams_r,
+    ):
+      sell, signal_name = exit_func(*signal_args)
 
-    # Williams %R based sells
-    if not sell:
-      sell, signal_name = self.long_exit_williams_r(
-        self.long_high_profit_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+      if sell:
+        break
 
     # Stoplosses
     if not sell:
       sell, signal_name = self.long_exit_stoploss(
-        self.long_high_profit_mode_name,
+        mode_name,
         current_rate,
         profit_stake,
         profit_ratio,
@@ -27196,16 +27128,20 @@ class NostalgiaForInfinityX7(IStrategy):
         current_time,
         enter_tags,
       )
+
     # Profit Target Signal
-    # Check if pair exist on target_profit_cache
-    if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-      previous_rate = self.target_profit_cache.data[pair]["rate"]
-      previous_profit = self.target_profit_cache.data[pair]["profit"]
-      previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      previous_time_profit_reached = datetime.fromisoformat(self.target_profit_cache.data[pair]["time_profit_reached"])
+    cache = self.target_profit_cache
+    cache_data = cache.data if cache is not None else None
+    target_data = cache_data.get(pair) if cache_data else None
+
+    if target_data:
+      previous_rate = target_data["rate"]
+      previous_profit = target_data["profit"]
+      previous_sell_reason = target_data["sell_reason"]
+      previous_time_profit_reached = datetime.fromisoformat(target_data["time_profit_reached"])
 
       sell_max, signal_name_max = self.exit_profit_target(
-        self.long_high_profit_mode_name,
+        mode_name,
         pair,
         trade,
         current_time,
@@ -27222,12 +27158,14 @@ class NostalgiaForInfinityX7(IStrategy):
         previous_time_profit_reached,
         enter_tags,
       )
+
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.long_high_profit_mode_name}_stoploss_u_e"]:
+
+      if previous_sell_reason == stoploss_u_e:
         if profit_ratio > (previous_profit + 0.001):
           mark_pair, mark_signal = self.mark_profit_target(
-            self.long_high_profit_mode_name,
+            mode_name,
             pair,
             True,
             previous_sell_reason,
@@ -27238,14 +27176,19 @@ class NostalgiaForInfinityX7(IStrategy):
             last_candle,
             previous_candle_1,
           )
+
           if mark_pair:
-            self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
-      elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.long_high_profit_mode_name}_stoploss_doom"]
-      ):
-        # Update the target, raise it.
+            self._set_profit_target(
+              pair,
+              mark_signal,
+              current_rate,
+              profit_ratio,
+              current_time,
+            )
+
+      elif profit_init_ratio > (previous_profit + 0.001) and previous_sell_reason != stoploss_doom:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_high_profit_mode_name,
+          mode_name,
           pair,
           True,
           previous_sell_reason,
@@ -27256,20 +27199,23 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
 
     # Add the pair to the list, if a sell triggered and conditions met
     if sell and signal_name is not None:
-      previous_profit = None
-      if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-        previous_profit = self.target_profit_cache.data[pair]["profit"]
-      if signal_name in [
-        f"exit_{self.long_high_profit_mode_name}_stoploss_doom",
-        f"exit_{self.long_high_profit_mode_name}_stoploss_u_e",
-      ]:
+      previous_profit = target_data["profit"] if target_data else None
+
+      if signal_name in (stoploss_doom, stoploss_u_e):
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_high_profit_mode_name,
+          mode_name,
           pair,
           sell,
           signal_name,
@@ -27280,14 +27226,21 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_ratio,
+            current_time,
+          )
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
+          return True, signal_name
+
       elif (previous_profit is None) or (previous_profit < profit_init_ratio):
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_high_profit_mode_name,
+          mode_name,
           pair,
           sell,
           signal_name,
@@ -27298,30 +27251,40 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
+          return True, signal_name
+
     else:
       if profit_init_ratio >= 0.03:
-        previous_profit = None
-        if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-          previous_profit = self.target_profit_cache.data[pair]["profit"]
+        previous_profit = target_data["profit"] if target_data else None
+
         if (previous_profit is None) or (previous_profit < profit_init_ratio):
-          mark_signal = f"exit_profit_{self.long_high_profit_mode_name}_max"
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            profit_max,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
 
     if signal_name not in [
-      f"exit_profit_{self.long_high_profit_mode_name}_max",
-      # f"exit_{self.long_high_profit_mode_name}_stoploss_doom",
-      # f"exit_{self.long_high_profit_mode_name}_stoploss_u_e",
+      profit_max,
+      # stoploss_doom,
+      # stoploss_u_e,
     ]:
-      if sell and (signal_name is not None):
-        return True, f"{signal_name}"
+      if sell and signal_name is not None:
+        return True, signal_name
 
-    #  Here ends exit signal conditions for long_exit_high_profit
-
+    # Here ends exit signal conditions for long_exit_high_profit
     return False, None
 
   # Long Exit Rapid
@@ -27349,186 +27312,129 @@ class NostalgiaForInfinityX7(IStrategy):
     enter_tags,
   ) -> tuple:
     is_backtest = self.is_backtest_mode()
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
+
+    mode = self.long_rapid_mode_name
+    cache = self.target_profit_cache
+    cache_data = cache.data if cache is not None else None
+    pair_cache = cache_data.get(pair) if cache_data else None
+
     sell = False
     signal_name = None
 
+    common_args = (
+      mode,
+      profit_init_ratio,
+      max_profit,
+      max_loss,
+      last_candle,
+      previous_candle_1,
+      previous_candle_2,
+      previous_candle_3,
+      previous_candle_4,
+      previous_candle_5,
+      trade,
+      current_time,
+      enter_tags,
+    )
+
     # if the profit is negative skip checking these
     if profit_init_ratio > 0.0:
-      # Original sell signals
-      sell, signal_name = self.long_exit_signals(
-        self.long_rapid_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
-
-      # Main sell signals
-      if not sell:
-        sell, signal_name = self.long_exit_main(
-          self.long_rapid_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
-
-      # Williams %R based sells
-      if not sell:
-        sell, signal_name = self.long_exit_williams_r(
-          self.long_rapid_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
-
-      # Downtrend/descending based sells
-      if not sell:
-        sell, signal_name = self.long_exit_dec(
-          self.long_rapid_mode_name,
-          profit_init_ratio,
-          max_profit,
-          max_loss,
-          last_candle,
-          previous_candle_1,
-          previous_candle_2,
-          previous_candle_3,
-          previous_candle_4,
-          previous_candle_5,
-          trade,
-          current_time,
-          enter_tags,
-        )
+      for exit_func in (
+        self.long_exit_signals,
+        self.long_exit_main,
+        self.long_exit_williams_r,
+        self.long_exit_dec,
+      ):
+        sell, signal_name = exit_func(*common_args)
+        if sell:
+          break
 
     # Extra exit logic
     if not sell:
-      if (0.09 >= profit_init_ratio > 0.005) and (last_candle["RSI_14"] > 78.0):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_1"
-      elif (0.09 >= profit_init_ratio > 0.005) and (last_candle["MFI_14"] > 84.0):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_2"
-      elif (0.09 >= profit_init_ratio > 0.005) and (last_candle["WILLR_14"] >= -0.1):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_3"
-      elif (
-        (0.09 >= profit_init_ratio > 0.005)
-        and (last_candle["RSI_14"] >= 72.0)
-        and (last_candle["RSI_3"] > 90.0)
-        and (last_candle["RSI_3_15m"] > 90.0)
-      ):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_4"
-      elif (0.09 >= profit_init_ratio > 0.005) and (last_candle["RSI_3_15m"] > 96.0):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_5"
-      elif (0.09 >= profit_init_ratio > 0.005) and (last_candle["RSI_3"] > 85.0) and (last_candle["RSI_3_15m"] > 85.0):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_6"
-      elif (0.09 >= profit_init_ratio > 0.005) and (last_candle["RSI_3"] > 90.0) and (last_candle["RSI_3_15m"] > 80.0):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_7"
-      elif (0.09 >= profit_init_ratio > 0.005) and (last_candle["RSI_3"] > 92.0) and (last_candle["RSI_3_15m"] > 75.0):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_8"
-      elif (0.09 >= profit_init_ratio > 0.005) and (last_candle["RSI_3"] > 94.0) and (last_candle["RSI_3_15m"] > 70.0):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_9"
-      elif (0.09 >= profit_init_ratio > 0.005) and (last_candle["RSI_3"] > 99.0):
-        sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_rpd_10"
+      in_range = 0.09 >= profit_init_ratio > 0.005
 
-      if is_system_v3_2:
-        # Stoplosses
-        if self.system_v3_2_stops_enable and (
-          profit_stake
-          < -(
-            filled_entries[0].cost
-            * (
-              self.system_v3_2_stop_threshold_rapid_futures
-              if self.is_futures_mode
-              else self.system_v3_2_stop_threshold_rapid_spot
-            )
-            / trade.leverage
-          )
-        ):
-          sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_stoploss_doom"
-      elif is_system_v3_1:
-        # Stoplosses
-        if self.stops_enable and (
-          profit_stake
-          < -(
-            filled_entries[0].cost
-            * (
-              self.system_v3_1_stop_threshold_rapid_futures
-              if self.is_futures_mode
-              else self.system_v3_1_stop_threshold_rapid_spot
-            )
-            / trade.leverage
-          )
-        ):
-          sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_stoploss_doom"
-      elif is_system_v3:
-        # Stoplosses
-        if self.stops_enable and (
-          profit_stake
-          < -(
-            filled_entries[0].cost
-            * (
-              self.system_v3_stop_threshold_rapid_futures
-              if self.is_futures_mode
-              else self.system_v3_stop_threshold_rapid_spot
-            )
-            / trade.leverage
-          )
-        ):
-          sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_stoploss_doom"
-      else:
-        # Stoplosses
-        if (
+      if in_range:
+        rsi14 = last_candle["RSI_14"]
+        mfi14 = last_candle["MFI_14"]
+        willr14 = last_candle["WILLR_14"]
+        rsi3 = last_candle["RSI_3"]
+        rsi3_15m = last_candle["RSI_3_15m"]
+
+        rapid_conditions = (
+          (rsi14 > 78.0, f"exit_{mode}_rpd_1"),
+          (mfi14 > 84.0, f"exit_{mode}_rpd_2"),
+          (willr14 >= -0.1, f"exit_{mode}_rpd_3"),
           (
-            self.stops_enable
-            and (
-              profit_stake
-              < -(
-                filled_entries[0].cost
-                * (self.stop_threshold_rapid_futures if self.is_futures_mode else self.stop_threshold_rapid_spot)
-              )
-            )
+            rsi14 >= 72.0 and rsi3 > 90.0 and rsi3_15m > 90.0,
+            f"exit_{mode}_rpd_4",
+          ),
+          (rsi3_15m > 96.0, f"exit_{mode}_rpd_5"),
+          (rsi3 > 85.0 and rsi3_15m > 85.0, f"exit_{mode}_rpd_6"),
+          (rsi3 > 90.0 and rsi3_15m > 80.0, f"exit_{mode}_rpd_7"),
+          (rsi3 > 92.0 and rsi3_15m > 75.0, f"exit_{mode}_rpd_8"),
+          (rsi3 > 94.0 and rsi3_15m > 70.0, f"exit_{mode}_rpd_9"),
+          (rsi3 > 99.0, f"exit_{mode}_rpd_10"),
+        )
+
+        for condition, signal in rapid_conditions:
+          if condition:
+            sell, signal_name = True, signal
+            break
+
+      if not sell:
+        entry_cost = filled_entries[0].cost
+        leverage = trade.leverage
+        stop_threshold = None
+        stop_enabled = False
+
+        if is_system_v3_2:
+          stop_enabled = self.system_v3_2_stops_enable
+          stop_threshold = (
+            self.system_v3_2_stop_threshold_rapid_futures
+            if self.is_futures_mode
+            else self.system_v3_2_stop_threshold_rapid_spot
           )
-          # temporary
-          and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
-        ):
-          sell, signal_name = True, f"exit_{self.long_rapid_mode_name}_stoploss_doom"
+        elif is_system_v3_1:
+          stop_enabled = self.stops_enable
+          stop_threshold = (
+            self.system_v3_1_stop_threshold_rapid_futures
+            if self.is_futures_mode
+            else self.system_v3_1_stop_threshold_rapid_spot
+          )
+        elif is_system_v3:
+          stop_enabled = self.stops_enable
+          stop_threshold = (
+            self.system_v3_stop_threshold_rapid_futures
+            if self.is_futures_mode
+            else self.system_v3_stop_threshold_rapid_spot
+          )
+        else:
+          stop_enabled = self.stops_enable
+          stop_threshold = (
+            self.stop_threshold_rapid_futures if self.is_futures_mode else self.stop_threshold_rapid_spot
+          )
+
+        if stop_enabled:
+          stoploss_value = -(entry_cost * stop_threshold / leverage)
+
+          if is_system_v3 or is_system_v3_1 or is_system_v3_2:
+            if profit_stake < stoploss_value:
+              sell, signal_name = True, f"exit_{mode}_stoploss_doom"
+          elif profit_stake < stoploss_value and (
+            is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13)
+          ):
+            sell, signal_name = True, f"exit_{mode}_stoploss_doom"
 
     # Profit Target Signal
-    # Check if pair exist on target_profit_cache
-    if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-      previous_rate = self.target_profit_cache.data[pair]["rate"]
-      previous_profit = self.target_profit_cache.data[pair]["profit"]
-      previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      previous_time_profit_reached = datetime.fromisoformat(self.target_profit_cache.data[pair]["time_profit_reached"])
+    if pair_cache:
+      previous_rate = pair_cache["rate"]
+      previous_profit = pair_cache["profit"]
+      previous_sell_reason = pair_cache["sell_reason"]
+      previous_time_profit_reached = datetime.fromisoformat(pair_cache["time_profit_reached"])
 
       sell_max, signal_name_max = self.exit_profit_target(
-        self.long_rapid_mode_name,
+        mode,
         pair,
         trade,
         current_time,
@@ -27545,12 +27451,14 @@ class NostalgiaForInfinityX7(IStrategy):
         previous_time_profit_reached,
         enter_tags,
       )
+
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.long_rapid_mode_name}_stoploss_u_e"]:
+
+      if previous_sell_reason == f"exit_{mode}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.001):
           mark_pair, mark_signal = self.mark_profit_target(
-            self.long_rapid_mode_name,
+            mode,
             pair,
             True,
             previous_sell_reason,
@@ -27561,14 +27469,19 @@ class NostalgiaForInfinityX7(IStrategy):
             last_candle,
             previous_candle_1,
           )
+
           if mark_pair:
-            self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
-      elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.long_rapid_mode_name}_stoploss_doom"]
-      ):
-        # Update the target, raise it.
+            self._set_profit_target(
+              pair,
+              mark_signal,
+              current_rate,
+              profit_ratio,
+              current_time,
+            )
+
+      elif profit_init_ratio > (previous_profit + 0.001) and previous_sell_reason != f"exit_{mode}_stoploss_doom":
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_rapid_mode_name,
+          mode,
           pair,
           True,
           previous_sell_reason,
@@ -27579,28 +27492,34 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
 
     # Add the pair to the list, if a sell triggered and conditions met
     if sell and signal_name is not None:
-      previous_profit = None
-      previous_sell_reason = ""
-      if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-        previous_profit = self.target_profit_cache.data[pair]["profit"]
-        previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      if signal_name in [
-        f"exit_{self.long_rapid_mode_name}_stoploss_doom",
-        f"exit_{self.long_rapid_mode_name}_stoploss_u_e",
-      ] and (
-        previous_sell_reason
-        not in [
-          f"exit_{self.long_rapid_mode_name}_stoploss_doom",
-          f"exit_profit_{self.long_rapid_mode_name}_stoploss_u_e",
-        ]
-      ):
+      previous_profit = pair_cache["profit"] if pair_cache else None
+      previous_sell_reason = pair_cache["sell_reason"] if pair_cache else ""
+
+      protected_signals = {
+        f"exit_{mode}_stoploss_doom",
+        f"exit_{mode}_stoploss_u_e",
+      }
+
+      blocked_previous_signals = {
+        f"exit_{mode}_stoploss_doom",
+        f"exit_profit_{mode}_stoploss_u_e",
+      }
+
+      if signal_name in protected_signals and previous_sell_reason not in blocked_previous_signals:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_rapid_mode_name,
+          mode,
           pair,
           sell,
           signal_name,
@@ -27611,14 +27530,21 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_ratio,
+            current_time,
+          )
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
-      elif (previous_profit is None) or (previous_profit < profit_init_ratio):
+          return True, signal_name
+
+      elif previous_profit is None or previous_profit < profit_init_ratio:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_rapid_mode_name,
+          mode,
           pair,
           sell,
           signal_name,
@@ -27629,30 +27555,40 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
-    else:
-      if profit_init_ratio >= 0.005:
-        previous_profit = None
-        if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-          previous_profit = self.target_profit_cache.data[pair]["profit"]
-        if (previous_profit is None) or (previous_profit < profit_init_ratio):
-          mark_signal = f"exit_profit_{self.long_rapid_mode_name}_max"
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          return True, signal_name
 
-    if signal_name not in [
-      f"exit_profit_{self.long_rapid_mode_name}_max",
-      f"exit_{self.long_rapid_mode_name}_stoploss_doom",
-      f"exit_{self.long_rapid_mode_name}_stoploss_u_e",
-    ]:
-      if sell and (signal_name is not None):
-        return True, f"{signal_name}"
+    elif profit_init_ratio >= 0.005:
+      previous_profit = pair_cache["profit"] if pair_cache else None
 
-    #  Here ends exit signal conditions for long_exit_rapid
+      if previous_profit is None or previous_profit < profit_init_ratio:
+        self._set_profit_target(
+          pair,
+          f"exit_profit_{mode}_max",
+          current_rate,
+          profit_init_ratio,
+          current_time,
+        )
 
+    ignored_signals = {
+      f"exit_profit_{mode}_max",
+      f"exit_{mode}_stoploss_doom",
+      f"exit_{mode}_stoploss_u_e",
+    }
+
+    if sell and signal_name is not None and signal_name not in ignored_signals:
+      return True, signal_name
+
+    # Here ends exit signal conditions for long_exit_rapid
     return False, None
 
   # Long Exit Grind
@@ -27682,8 +27618,7 @@ class NostalgiaForInfinityX7(IStrategy):
     if profit_init_ratio > 0.25:
       return True, f"exit_{self.long_grind_mode_name}_g"
 
-    #  Here ends exit signal conditions for long_exit_grind
-
+    # Here ends exit signal conditions for long_exit_grind
     return False, None
 
   # Long Exit Btc
@@ -27713,8 +27648,7 @@ class NostalgiaForInfinityX7(IStrategy):
     if profit_init_ratio > 0.25:
       return True, f"exit_{self.long_btc_mode_name}_g"
 
-    #  Here ends exit signal conditions for long_exit_btc
-
+    # Here ends exit signal conditions for long_exit_btc
     return False, None
 
   # Long Exit Top Coins
@@ -27741,11 +27675,17 @@ class NostalgiaForInfinityX7(IStrategy):
     current_time: "datetime",
     enter_tags,
   ) -> tuple:
-    sell = False
+    mode = self.long_top_coins_mode_name
 
-    # Original sell signals
-    sell, signal_name = self.long_exit_signals(
-      self.long_top_coins_mode_name,
+    cache = self.target_profit_cache
+    cache_data = cache.data if cache is not None else None
+    pair_cache = cache_data.get(pair) if cache_data else None
+
+    sell = False
+    signal_name = None
+
+    common_args = (
+      mode,
       profit_init_ratio,
       max_profit,
       max_loss,
@@ -27760,64 +27700,22 @@ class NostalgiaForInfinityX7(IStrategy):
       enter_tags,
     )
 
-    # Main sell signals
-    if not sell:
-      sell, signal_name = self.long_exit_main(
-        self.long_top_coins_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+    # Original/Main/Williams/DEC sell signals
+    for exit_func in (
+      self.long_exit_signals,
+      self.long_exit_main,
+      self.long_exit_williams_r,
+      self.long_exit_dec,
+    ):
+      sell, signal_name = exit_func(*common_args)
 
-    # Williams %R based sells
-    if not sell:
-      sell, signal_name = self.long_exit_williams_r(
-        self.long_top_coins_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
-
-    # Downtrend/descending based sells
-    if not sell:
-      sell, signal_name = self.long_exit_dec(
-        self.long_top_coins_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+      if sell:
+        break
 
     # Stoplosses
     if not sell:
       sell, signal_name = self.long_exit_stoploss(
-        self.long_top_coins_mode_name,
+        mode,
         current_rate,
         profit_stake,
         profit_ratio,
@@ -27839,15 +27737,14 @@ class NostalgiaForInfinityX7(IStrategy):
       )
 
     # Profit Target Signal
-    # Check if pair exist on target_profit_cache
-    if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-      previous_rate = self.target_profit_cache.data[pair]["rate"]
-      previous_profit = self.target_profit_cache.data[pair]["profit"]
-      previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      previous_time_profit_reached = datetime.fromisoformat(self.target_profit_cache.data[pair]["time_profit_reached"])
+    if pair_cache:
+      previous_rate = pair_cache["rate"]
+      previous_profit = pair_cache["profit"]
+      previous_sell_reason = pair_cache["sell_reason"]
+      previous_time_profit_reached = datetime.fromisoformat(pair_cache["time_profit_reached"])
 
       sell_max, signal_name_max = self.exit_profit_target(
-        self.long_top_coins_mode_name,
+        mode,
         pair,
         trade,
         current_time,
@@ -27864,12 +27761,14 @@ class NostalgiaForInfinityX7(IStrategy):
         previous_time_profit_reached,
         enter_tags,
       )
+
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.long_top_coins_mode_name}_stoploss_u_e"]:
+
+      if previous_sell_reason == f"exit_{mode}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.005):
           mark_pair, mark_signal = self.mark_profit_target(
-            self.long_top_coins_mode_name,
+            mode,
             pair,
             True,
             previous_sell_reason,
@@ -27880,14 +27779,19 @@ class NostalgiaForInfinityX7(IStrategy):
             last_candle,
             previous_candle_1,
           )
+
           if mark_pair:
-            self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
-      elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.long_top_coins_mode_name}_stoploss_doom"]
-      ):
-        # Update the target, raise it.
+            self._set_profit_target(
+              pair,
+              mark_signal,
+              current_rate,
+              profit_ratio,
+              current_time,
+            )
+
+      elif profit_init_ratio > (previous_profit + 0.001) and previous_sell_reason != f"exit_{mode}_stoploss_doom":
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_top_coins_mode_name,
+          mode,
           pair,
           True,
           previous_sell_reason,
@@ -27898,80 +27802,84 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            profit_init_ratio,
+            current_time,
+          )
 
     # Add the pair to the list, if a sell triggered and conditions met
     if sell and signal_name is not None:
-      previous_profit = None
-      previous_sell_reason = ""
-      if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-        previous_profit = self.target_profit_cache.data[pair]["profit"]
-        previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      if signal_name in [
-        f"exit_{self.long_top_coins_mode_name}_stoploss_doom",
-        f"exit_{self.long_top_coins_mode_name}_stoploss_u_e",
-      ] and (
-        previous_sell_reason
-        not in [
-          f"exit_{self.long_top_coins_mode_name}_stoploss_doom",
-          f"exit_profit_{self.long_top_coins_mode_name}_stoploss_u_e",
-        ]
-      ):
+      previous_profit = pair_cache["profit"] if pair_cache else None
+      previous_sell_reason = pair_cache["sell_reason"] if pair_cache else ""
+
+      protected_signals = {
+        f"exit_{mode}_stoploss_doom",
+        f"exit_{mode}_stoploss_u_e",
+      }
+
+      blocked_previous_signals = {
+        f"exit_{mode}_stoploss_doom",
+        f"exit_profit_{mode}_stoploss_u_e",
+      }
+
+      target_profit = profit_ratio if signal_name in protected_signals else profit_init_ratio
+
+      should_mark = (signal_name in protected_signals and previous_sell_reason not in blocked_previous_signals) or (
+        signal_name not in protected_signals and (previous_profit is None or previous_profit < profit_init_ratio)
+      )
+
+      if should_mark:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_top_coins_mode_name,
+          mode,
           pair,
           sell,
           signal_name,
           trade,
           current_time,
           current_rate,
-          profit_ratio,
+          target_profit,
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
+          self._set_profit_target(
+            pair,
+            mark_signal,
+            current_rate,
+            target_profit,
+            current_time,
+          )
         else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
-      elif (previous_profit is None) or (previous_profit < profit_init_ratio):
-        mark_pair, mark_signal = self.mark_profit_target(
-          self.long_top_coins_mode_name,
+          return True, signal_name
+
+    elif profit_init_ratio >= 0.005:
+      previous_profit = pair_cache["profit"] if pair_cache else None
+
+      if previous_profit is None or previous_profit < profit_init_ratio:
+        self._set_profit_target(
           pair,
-          sell,
-          signal_name,
-          trade,
-          current_time,
+          f"exit_profit_{mode}_max",
           current_rate,
           profit_init_ratio,
-          last_candle,
-          previous_candle_1,
+          current_time,
         )
-        if mark_pair:
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
-        else:
-          # Just sell it, without maximize
-          return True, f"{signal_name}"
-    else:
-      if profit_init_ratio >= 0.005:
-        previous_profit = None
-        if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-          previous_profit = self.target_profit_cache.data[pair]["profit"]
-        if (previous_profit is None) or (previous_profit < profit_init_ratio):
-          mark_signal = f"exit_profit_{self.long_top_coins_mode_name}_max"
-          self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
 
-    if signal_name not in [
-      f"exit_profit_{self.long_top_coins_mode_name}_max",
-      f"exit_{self.long_top_coins_mode_name}_stoploss_doom",
-      f"exit_{self.long_top_coins_mode_name}_stoploss_u_e",
-    ]:
-      if sell and (signal_name is not None):
-        return True, f"{signal_name}"
+    ignored_signals = {
+      f"exit_profit_{mode}_max",
+      f"exit_{mode}_stoploss_doom",
+      f"exit_{mode}_stoploss_u_e",
+    }
 
-    #  Here ends exit signal conditions for long_exit_top_coins
+    if sell and signal_name is not None and signal_name not in ignored_signals:
+      return True, signal_name
 
+    # Here ends exit signal conditions for long_exit_top_coins
     return False, None
 
   # Long Exit Scalp
@@ -27998,14 +27906,14 @@ class NostalgiaForInfinityX7(IStrategy):
     current_time: "datetime",
     enter_tags,
   ) -> tuple:
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
-    sell = False
+    mode = self.long_scalp_mode_name
 
-    # Original sell signals
-    sell, signal_name = self.long_exit_signals(
-      self.long_scalp_mode_name,
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
+
+    sell = False
+    signal_name = None
+
+    signal_args = (
       profit_init_ratio,
       max_profit,
       max_loss,
@@ -28020,120 +27928,74 @@ class NostalgiaForInfinityX7(IStrategy):
       enter_tags,
     )
 
+    # Original sell signals
+    sell, signal_name = self.long_exit_signals(mode, *signal_args)
+
     # Main sell signals
     if not sell:
-      sell, signal_name = self.long_exit_main(
-        self.long_scalp_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+      sell, signal_name = self.long_exit_main(mode, *signal_args)
 
     # Williams %R based sells
     if not sell:
-      sell, signal_name = self.long_exit_williams_r(
-        self.long_scalp_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+      sell, signal_name = self.long_exit_williams_r(mode, *signal_args)
 
     # Downtrend/descending based sells
     if not sell:
-      sell, signal_name = self.long_exit_dec(
-        self.long_scalp_mode_name,
-        profit_init_ratio,
-        max_profit,
-        max_loss,
-        last_candle,
-        previous_candle_1,
-        previous_candle_2,
-        previous_candle_3,
-        previous_candle_4,
-        previous_candle_5,
-        trade,
-        current_time,
-        enter_tags,
-      )
+      sell, signal_name = self.long_exit_dec(mode, *signal_args)
 
     # Extra exit logic
     if not sell:
+      entry_cost = filled_entries[0].cost
+      leverage = trade.leverage
+
       if is_system_v3_2:
-        # Stoplosses
-        if self.system_v3_2_stops_enable and (
-          profit_stake
-          < -(
-            filled_entries[0].cost
-            * (
-              self.system_v3_2_stop_threshold_scalp_futures
-              if self.is_futures_mode
-              else self.system_v3_2_stop_threshold_scalp_spot
-            )
-            / trade.leverage
-          )
-        ):
-          sell, signal_name = True, f"exit_{self.long_scalp_mode_name}_stoploss_doom"
+        threshold = (
+          self.system_v3_2_stop_threshold_scalp_futures
+          if self.is_futures_mode
+          else self.system_v3_2_stop_threshold_scalp_spot
+        )
+
+        stoploss_hit = self.system_v3_2_stops_enable and profit_stake < -(entry_cost * threshold / leverage)
+
       elif is_system_v3_1:
-        # Stoplosses
-        if profit_stake < -(
-          filled_entries[0].cost
-          * (
-            self.system_v3_1_stop_threshold_scalp_futures
-            if self.is_futures_mode
-            else self.system_v3_1_stop_threshold_scalp_spot
-          )
-          / trade.leverage
-        ):
-          sell, signal_name = True, f"exit_{self.long_scalp_mode_name}_stoploss_doom"
+        threshold = (
+          self.system_v3_1_stop_threshold_scalp_futures
+          if self.is_futures_mode
+          else self.system_v3_1_stop_threshold_scalp_spot
+        )
+
+        stoploss_hit = profit_stake < -(entry_cost * threshold / leverage)
+
       elif is_system_v3:
-        # Stoplosses
-        if profit_stake < -(
-          filled_entries[0].cost
-          * (
-            self.system_v3_stop_threshold_scalp_futures
-            if self.is_futures_mode
-            else self.system_v3_stop_threshold_scalp_spot
-          )
-          / trade.leverage
-        ):
-          sell, signal_name = True, f"exit_{self.long_scalp_mode_name}_stoploss_doom"
+        threshold = (
+          self.system_v3_stop_threshold_scalp_futures
+          if self.is_futures_mode
+          else self.system_v3_stop_threshold_scalp_spot
+        )
+
+        stoploss_hit = profit_stake < -(entry_cost * threshold / leverage)
+
       else:
-        # Stoplosses
-        if profit_stake < -(
-          filled_entries[0].cost
-          * (self.stop_threshold_scalp_futures if self.is_futures_mode else self.stop_threshold_scalp_spot)
-          # / (trade.leverage if self.is_futures_mode else 1.0)
-        ):
-          sell, signal_name = True, f"exit_{self.long_scalp_mode_name}_stoploss_doom"
+        threshold = self.stop_threshold_scalp_futures if self.is_futures_mode else self.stop_threshold_scalp_spot
+
+        stoploss_hit = profit_stake < -(entry_cost * threshold)
+
+      if stoploss_hit:
+        sell, signal_name = True, f"exit_{mode}_stoploss_doom"
 
     # Profit Target Signal
-    # Check if pair exist on target_profit_cache
-    if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-      previous_rate = self.target_profit_cache.data[pair]["rate"]
-      previous_profit = self.target_profit_cache.data[pair]["profit"]
-      previous_sell_reason = self.target_profit_cache.data[pair]["sell_reason"]
-      previous_time_profit_reached = datetime.fromisoformat(self.target_profit_cache.data[pair]["time_profit_reached"])
+    cache = self.target_profit_cache
+    cache_data = cache.data if cache is not None else None
+    pair_data = cache_data.get(pair) if cache_data and pair in cache_data else None
+
+    if pair_data:
+      previous_rate = pair_data["rate"]
+      previous_profit = pair_data["profit"]
+      previous_sell_reason = pair_data["sell_reason"]
+      previous_time_profit_reached = datetime.fromisoformat(pair_data["time_profit_reached"])
 
       sell_max, signal_name_max = self.exit_profit_target(
-        self.long_scalp_mode_name,
+        mode,
         pair,
         trade,
         current_time,
@@ -28150,12 +28012,14 @@ class NostalgiaForInfinityX7(IStrategy):
         previous_time_profit_reached,
         enter_tags,
       )
+
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.long_scalp_mode_name}_stoploss_u_e"]:
+
+      if previous_sell_reason == f"exit_{mode}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.005):
           mark_pair, mark_signal = self.mark_profit_target(
-            self.long_scalp_mode_name,
+            mode,
             pair,
             True,
             previous_sell_reason,
@@ -28166,14 +28030,14 @@ class NostalgiaForInfinityX7(IStrategy):
             last_candle,
             previous_candle_1,
           )
+
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
-      elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.long_scalp_mode_name}_stoploss_doom"]
-      ):
+
+      elif profit_init_ratio > (previous_profit + 0.001) and previous_sell_reason != f"exit_{mode}_stoploss_doom":
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_scalp_mode_name,
+          mode,
           pair,
           True,
           previous_sell_reason,
@@ -28184,20 +28048,20 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
           self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
 
     # Add the pair to the list, if a sell triggered and conditions met
     if sell and signal_name is not None:
-      previous_profit = None
-      if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-        previous_profit = self.target_profit_cache.data[pair]["profit"]
-      if signal_name in [
-        f"exit_{self.long_scalp_mode_name}_stoploss_doom",
-        f"exit_{self.long_scalp_mode_name}_stoploss_u_e",
-      ]:
+      previous_profit = pair_data["profit"] if pair_data else None
+
+      if signal_name in {
+        f"exit_{mode}_stoploss_doom",
+        f"exit_{mode}_stoploss_u_e",
+      }:
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_scalp_mode_name,
+          mode,
           pair,
           sell,
           signal_name,
@@ -28208,14 +28072,16 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
           self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
         else:
           # Just sell it, without maximize
           return True, f"{signal_name}"
+
       elif (previous_profit is None) or (previous_profit < profit_init_ratio):
         mark_pair, mark_signal = self.mark_profit_target(
-          self.long_scalp_mode_name,
+          mode,
           pair,
           sell,
           signal_name,
@@ -28226,29 +28092,30 @@ class NostalgiaForInfinityX7(IStrategy):
           last_candle,
           previous_candle_1,
         )
+
         if mark_pair:
           self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
         else:
           # Just sell it, without maximize
           return True, f"{signal_name}"
+
     else:
       if profit_init_ratio >= 0.005:
-        previous_profit = None
-        if self.target_profit_cache is not None and pair in self.target_profit_cache.data:
-          previous_profit = self.target_profit_cache.data[pair]["profit"]
+        previous_profit = pair_data["profit"] if pair_data else None
+
         if (previous_profit is None) or (previous_profit < profit_init_ratio):
-          mark_signal = f"exit_profit_{self.long_scalp_mode_name}_max"
+          mark_signal = f"exit_profit_{mode}_max"
           self._set_profit_target(pair, mark_signal, current_rate, profit_init_ratio, current_time)
 
-    if signal_name not in [
-      f"exit_profit_{self.long_scalp_mode_name}_max",
-      f"exit_{self.long_scalp_mode_name}_stoploss_doom",
-      f"exit_{self.long_scalp_mode_name}_stoploss_u_e",
-    ]:
+    if signal_name not in {
+      f"exit_profit_{mode}_max",
+      f"exit_{mode}_stoploss_doom",
+      f"exit_{mode}_stoploss_u_e",
+    }:
       if sell and (signal_name is not None):
         return True, f"{signal_name}"
 
-    #  Here ends exit signal conditions for long_exit_derisk
+    # Here ends exit signal conditions for long_exit_scalp
 
     return False, None
 
@@ -43980,9 +43847,7 @@ class NostalgiaForInfinityX7(IStrategy):
     buy_tag,
   ) -> tuple:
     is_backtest = self.is_backtest_mode()
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
     if not self.stops_enable:
       return False, None
     if is_system_v3_2:
@@ -44041,9 +43906,11 @@ class NostalgiaForInfinityX7(IStrategy):
             * (self.stop_threshold_doom_futures if self.is_futures_mode else self.stop_threshold_doom_spot)
           )
         )
-        and (self.has_valid_entry_conditions(trade, current_rate, last_candle, previous_candle_1) == False)
+        and (
+          self.has_valid_entry_conditions(trade, current_rate, last_candle, previous_candle_1, filled_entries) == False
+        )
         # temporary
-        and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+        and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
       ):
         return True, f"exit_{mode_name}_stoploss_doom"
 
@@ -44064,7 +43931,7 @@ class NostalgiaForInfinityX7(IStrategy):
       and (last_candle["RSI_14"] > (last_candle["RSI_14_1h"] + 24.0))
       # and (current_time - timedelta(minutes=720) > trade.open_date_utc)
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2025, 4, 3) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2025, 4, 3))
     ):
       return True, f"exit_{mode_name}_stoploss_u_e"
 
@@ -44111,24 +43978,23 @@ class NostalgiaForInfinityX7(IStrategy):
     **kwargs,
   ):
     is_backtest = self.is_backtest_mode()
-    min_stake = self.correct_min_stake(min_stake)
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
-    count_of_entries = trade.nr_of_successful_entries
-    count_of_exits = trade.nr_of_successful_exits
+    min_stake = self.correct_min_stake(min_stake)
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
 
     exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
+    count_of_exits = trade.nr_of_successful_exits
+
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -44141,9 +44007,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     current_stake_amount = trade.amount * exit_rate
     slice_amount = filled_entries[0].cost
@@ -44158,26 +44024,22 @@ class NostalgiaForInfinityX7(IStrategy):
       and all(c in (self.long_rebuy_mode_tags + self.long_grind_mode_tags) for c in enter_tags)
     )
 
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
     fee_open_rate = trade.fee_open if self.custom_fee_open_rate is None else self.custom_fee_open_rate
     fee_close_rate = trade.fee_close if self.custom_fee_close_rate is None else self.custom_fee_close_rate
 
     grind_1_max_sub_grinds = 0
-    grind_1_stakes = (
-      self.grinding_v2_grind_1_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_1_stakes_spot.copy()
+    grind_1_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_1_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_1_sub_thresholds = (
       self.grinding_v2_grind_1_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_1_thresholds_spot
     )
-    if (slice_amount * grind_1_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_1_stakes):
-        grind_1_stakes[i] *= multi
     grind_1_max_sub_grinds = len(grind_1_stakes)
     grind_1_derisk_grinds = (
       self.grinding_v2_grind_1_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_1_derisk_spot
@@ -44189,18 +44051,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_2_max_sub_grinds = 0
-    grind_2_stakes = (
-      self.grinding_v2_grind_2_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_2_stakes_spot.copy()
+    grind_2_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_2_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_2_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_2_sub_thresholds = (
       self.grinding_v2_grind_2_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_2_thresholds_spot
     )
-    if (slice_amount * grind_2_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_2_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_2_stakes):
-        grind_2_stakes[i] *= multi
     grind_2_max_sub_grinds = len(grind_2_stakes)
     grind_2_derisk_grinds = (
       self.grinding_v2_grind_2_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_2_derisk_spot
@@ -44212,18 +44072,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_3_max_sub_grinds = 0
-    grind_3_stakes = (
-      self.grinding_v2_grind_3_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_3_stakes_spot.copy()
+    grind_3_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_3_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_3_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_3_sub_thresholds = (
       self.grinding_v2_grind_3_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_3_thresholds_spot
     )
-    if (slice_amount * grind_3_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_3_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_3_stakes):
-        grind_3_stakes[i] *= multi
     grind_3_max_sub_grinds = len(grind_3_stakes)
     grind_3_derisk_grinds = (
       self.grinding_v2_grind_3_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_3_derisk_spot
@@ -44235,18 +44093,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_4_max_sub_grinds = 0
-    grind_4_stakes = (
-      self.grinding_v2_grind_4_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_4_stakes_spot.copy()
+    grind_4_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_4_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_4_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_4_sub_thresholds = (
       self.grinding_v2_grind_4_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_4_thresholds_spot
     )
-    if (slice_amount * grind_4_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_4_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_4_stakes):
-        grind_4_stakes[i] *= multi
     grind_4_max_sub_grinds = len(grind_4_stakes)
     grind_4_derisk_grinds = (
       self.grinding_v2_grind_4_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_4_derisk_spot
@@ -44258,18 +44114,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_5_max_sub_grinds = 0
-    grind_5_stakes = (
-      self.grinding_v2_grind_5_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_5_stakes_spot.copy()
+    grind_5_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_5_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_5_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_5_sub_thresholds = (
       self.grinding_v2_grind_5_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_5_thresholds_spot
     )
-    if (slice_amount * grind_5_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_5_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_5_stakes):
-        grind_5_stakes[i] *= multi
     grind_5_max_sub_grinds = len(grind_5_stakes)
     grind_5_derisk_grinds = (
       self.grinding_v2_grind_5_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_5_derisk_spot
@@ -44481,21 +44335,18 @@ class NostalgiaForInfinityX7(IStrategy):
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
+            order_tag = order.ft_order_tag.partition(" ")[0]
         if order_tag in ["derisk_level_1", "d"]:
           if not is_derisk_1_found:
             is_derisk_1_found = True
             is_derisk_1 = True
             derisk_1_order = order
-        elif order_tag in ["derisk_level_2"]:
+        elif order_tag == "derisk_level_2":
           if not is_derisk_2_found:
             is_derisk_2_found = True
             is_derisk_2 = True
             derisk_2_order = order
-        elif order_tag in ["derisk_level_3"]:
+        elif order_tag == "derisk_level_3":
           if not is_derisk_3_found:
             is_derisk_3_found = True
             is_derisk_3 = True
@@ -44524,7 +44375,7 @@ class NostalgiaForInfinityX7(IStrategy):
         elif not grind_5_is_exit_found and order_tag in ["grind_5_exit", "grind_5_derisk"]:
           grind_5_is_exit_found = True
           grind_5_exit_order = order
-        elif order_tag in ["derisk_global"]:
+        elif order_tag == "derisk_global":
           if not buyback_1_is_exit_found:
             buyback_1_is_exit_found = True
             buyback_1_exit_order = order
@@ -45083,7 +44934,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_1_use_derisk
       and (grind_1_sub_grind_count > 0)
       and (grind_1_current_grind_stake_profit < (slice_amount * grind_1_derisk_grinds))
-      and (grind_1_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_1_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -45206,7 +45057,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_2_use_derisk
       and (grind_2_sub_grind_count > 0)
       and (grind_2_current_grind_stake_profit < (slice_amount * grind_2_derisk_grinds))
-      and (grind_2_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_2_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_2_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -45329,7 +45180,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_3_use_derisk
       and (grind_3_sub_grind_count > 0)
       and (grind_3_current_grind_stake_profit < (slice_amount * grind_3_derisk_grinds))
-      and (grind_3_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_3_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_3_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -45479,7 +45330,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_4_use_derisk
       and (grind_4_sub_grind_count > 0)
       and (grind_4_current_grind_stake_profit < (slice_amount * grind_4_derisk_grinds))
-      and (grind_4_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_4_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_4_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -45617,7 +45468,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_5_use_derisk
       and (grind_5_sub_grind_count > 0)
       and (grind_5_current_grind_stake_profit < (slice_amount * grind_5_derisk_grinds))
-      and (grind_5_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_5_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_5_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -45775,7 +45626,7 @@ class NostalgiaForInfinityX7(IStrategy):
           )
         )
       )
-      and (buyback_1_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or buyback_1_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = buyback_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -45933,7 +45784,7 @@ class NostalgiaForInfinityX7(IStrategy):
           )
         )
       )
-      and (buyback_2_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or buyback_2_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = buyback_2_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -46091,7 +45942,7 @@ class NostalgiaForInfinityX7(IStrategy):
           )
         )
       )
-      and (buyback_3_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or buyback_3_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = buyback_3_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -46521,24 +46372,23 @@ class NostalgiaForInfinityX7(IStrategy):
     **kwargs,
   ):
     is_backtest = self.is_backtest_mode()
-    min_stake = self.correct_min_stake(min_stake)
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
-    count_of_entries = trade.nr_of_successful_entries
-    count_of_exits = trade.nr_of_successful_exits
+    min_stake = self.correct_min_stake(min_stake)
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
 
     exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
+    count_of_exits = trade.nr_of_successful_exits
+
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -46551,9 +46401,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     current_stake_amount = trade.amount * exit_rate
     slice_amount = filled_entries[0].cost
@@ -46568,30 +46418,24 @@ class NostalgiaForInfinityX7(IStrategy):
       and all(c in (self.long_rebuy_mode_tags + self.long_grind_mode_tags) for c in enter_tags)
     )
 
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
 
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
     fee_open_rate = trade.fee_open if self.custom_fee_open_rate is None else self.custom_fee_open_rate
     fee_close_rate = trade.fee_close if self.custom_fee_close_rate is None else self.custom_fee_close_rate
 
     grind_1_max_sub_grinds = 0
-    grind_1_stakes = (
-      self.system_v3_grind_1_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_1_stakes_spot.copy()
+    grind_1_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_1_stakes_futures if self.is_futures_mode else self.system_v3_grind_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     grind_1_sub_thresholds = (
       self.system_v3_grind_1_thresholds_futures if self.is_futures_mode else self.system_v3_grind_1_thresholds_spot
     )
-    if (slice_amount * grind_1_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / grind_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_1_stakes):
-        grind_1_stakes[i] *= multi
     grind_1_max_sub_grinds = len(grind_1_stakes)
     grind_1_derisk_grinds = (
       self.system_v3_grind_1_derisk_futures if self.is_futures_mode else self.system_v3_grind_1_derisk_spot
@@ -46603,18 +46447,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_2_max_sub_grinds = 0
-    grind_2_stakes = (
-      self.system_v3_grind_2_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_2_stakes_spot.copy()
+    grind_2_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_2_stakes_futures if self.is_futures_mode else self.system_v3_grind_2_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_2_sub_thresholds = (
       self.system_v3_grind_2_thresholds_futures if self.is_futures_mode else self.system_v3_grind_2_thresholds_spot
     )
-    if (slice_amount * grind_2_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_2_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_2_stakes):
-        grind_2_stakes[i] *= multi
     grind_2_max_sub_grinds = len(grind_2_stakes)
     grind_2_derisk_grinds = (
       self.system_v3_grind_2_derisk_futures if self.is_futures_mode else self.system_v3_grind_2_derisk_spot
@@ -46626,18 +46468,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_3_max_sub_grinds = 0
-    grind_3_stakes = (
-      self.system_v3_grind_3_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_3_stakes_spot.copy()
+    grind_3_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_3_stakes_futures if self.is_futures_mode else self.system_v3_grind_3_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_3_sub_thresholds = (
       self.system_v3_grind_3_thresholds_futures if self.is_futures_mode else self.system_v3_grind_3_thresholds_spot
     )
-    if (slice_amount * grind_3_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_3_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_3_stakes):
-        grind_3_stakes[i] *= multi
     grind_3_max_sub_grinds = len(grind_3_stakes)
     grind_3_derisk_grinds = (
       self.system_v3_grind_3_derisk_futures if self.is_futures_mode else self.system_v3_grind_3_derisk_spot
@@ -46649,18 +46489,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_4_max_sub_grinds = 0
-    grind_4_stakes = (
-      self.system_v3_grind_4_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_4_stakes_spot.copy()
+    grind_4_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_4_stakes_futures if self.is_futures_mode else self.system_v3_grind_4_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_4_sub_thresholds = (
       self.system_v3_grind_4_thresholds_futures if self.is_futures_mode else self.system_v3_grind_4_thresholds_spot
     )
-    if (slice_amount * grind_4_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_4_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_4_stakes):
-        grind_4_stakes[i] *= multi
     grind_4_max_sub_grinds = len(grind_4_stakes)
     grind_4_derisk_grinds = (
       self.system_v3_grind_4_derisk_futures if self.is_futures_mode else self.system_v3_grind_4_derisk_spot
@@ -46672,18 +46510,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_5_max_sub_grinds = 0
-    grind_5_stakes = (
-      self.system_v3_grind_5_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_5_stakes_spot.copy()
+    grind_5_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_5_stakes_futures if self.is_futures_mode else self.system_v3_grind_5_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_5_sub_thresholds = (
       self.system_v3_grind_5_thresholds_futures if self.is_futures_mode else self.system_v3_grind_5_thresholds_spot
     )
-    if (slice_amount * grind_5_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_5_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_5_stakes):
-        grind_5_stakes[i] *= multi
     grind_5_max_sub_grinds = len(grind_5_stakes)
     grind_5_derisk_grinds = (
       self.system_v3_grind_5_derisk_futures if self.is_futures_mode else self.system_v3_grind_5_derisk_spot
@@ -46884,26 +46720,23 @@ class NostalgiaForInfinityX7(IStrategy):
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
-        if order_tag in ["derisk_level_1"]:
+            order_tag = order.ft_order_tag.partition(" ")[0]
+        if order_tag == "derisk_level_1":
           if not is_derisk_1_found:
             is_derisk_1_found = True
             is_derisk_1 = True
             derisk_1_order = order
-        elif order_tag in ["derisk_level_2"]:
+        elif order_tag == "derisk_level_2":
           if not is_derisk_2_found:
             is_derisk_2_found = True
             is_derisk_2 = True
             derisk_2_order = order
-        elif order_tag in ["derisk_level_3"]:
+        elif order_tag == "derisk_level_3":
           if not is_derisk_3_found:
             is_derisk_3_found = True
             is_derisk_3 = True
             derisk_3_order = order
-        elif order_tag in ["derisk_level_4"]:
+        elif order_tag == "derisk_level_4":
           if not is_derisk_4_found:
             is_derisk_4_found = True
             is_derisk_4 = True
@@ -46929,7 +46762,7 @@ class NostalgiaForInfinityX7(IStrategy):
         elif not rebuy_is_exit_found and order_tag in ["rebuy_exit", "rebuy_derisk"]:
           rebuy_is_exit_found = True
           rebuy_exit_order = order
-        elif order_tag in ["derisk_global"]:
+        elif order_tag == "derisk_global":
           if not grind_1_is_exit_found:
             grind_1_is_exit_found = True
             grind_1_exit_order = order
@@ -48330,8 +48163,9 @@ class NostalgiaForInfinityX7(IStrategy):
     # g13 — SMA_9 cross SMA_21 + EMA_100 drop
     if (
       (last_candle["RSI_3"] > 5.0)
-      and (last_candle["RSI_3_1h"] > 10.0)
-      and (last_candle["RSI_3_4h"] > 10.0)
+      and (last_candle["RSI_3_1h"] > 20.0)
+      and (last_candle["RSI_14_1h"] > 40.0)
+      and (last_candle["STOCHRSIk_14_14_3_3_15m"] < 80.0)
       and (previous_candle["SMA_9"] < previous_candle["SMA_21"])
       and (last_candle["SMA_9"] > last_candle["SMA_21"])
       and (last_candle["close"] < (last_candle["EMA_100"] * 0.975))
@@ -48353,23 +48187,20 @@ class NostalgiaForInfinityX7(IStrategy):
       and (last_candle["RSI_3"] > 5.0)
       and (last_candle["RSI_3_15m"] > 10.0)
       and (last_candle["RSI_14"] < 40.0)
-      and (last_candle["RSI_14_1h"] < 50.0)
       and (last_candle["AROONU_14"] < 25.0)
       and (last_candle["AROONU_14_15m"] < 30.0)
-      and (last_candle["STOCHRSIk_14_14_3_3"] < 20.0)
+      and (last_candle["STOCHRSIk_14_14_3_3"] < 30.0)
       and (last_candle["STOCHRSIk_14_14_3_3_15m"] < 30.0)
     ):
       self._grind_entry_tag = "g15"
       return True
     # g16 — EMA_12 drop + BBL
     if (
-      (last_candle["RSI_3"] > 5.0)
+      (last_candle["RSI_3"] > 8.0)
       and (last_candle["RSI_3_15m"] > 15.0)
       and (last_candle["RSI_3_1h"] > 15.0)
       and (last_candle["RSI_3_4h"] > 15.0)
       and (last_candle["RSI_14"] < 35.0)
-      and (last_candle["ROC_9_1h"] > -20.0)
-      and (last_candle["ROC_9_4h"] > -25.0)
       and (last_candle["close"] < (last_candle["EMA_12"] * 0.965))
       and (last_candle["close"] < (last_candle["BBL_20_2.0"] * 0.999))
     ):
@@ -48377,19 +48208,19 @@ class NostalgiaForInfinityX7(IStrategy):
       return True
     # g17 — StochRSI + EMA_20 drop
     if (
-      (last_candle["RSI_3"] > 5.0)
+      (last_candle["RSI_3"] > 15.0)
       and (last_candle["RSI_3_15m"] > 15.0)
       and (last_candle["RSI_3_1h"] > 15.0)
       and (last_candle["RSI_3_4h"] > 15.0)
       and (last_candle["RSI_14"] < 30.0)
-      and (last_candle["STOCHRSIk_14_14_3_3"] < 30.0)
+      and (last_candle["STOCHRSIk_14_14_3_3"] < 20.0)
       and (last_candle["close"] < (last_candle["EMA_20"] * 0.985))
     ):
       self._grind_entry_tag = "g17"
       return True
-    # g18 — moderate loss recovery (slice_profit < -0.04)
+    # g18 — moderate loss recovery (slice_profit < -0.10)
     if (
-      (slice_profit < -0.04)
+      (slice_profit < -0.10)
       and (last_candle["RSI_3"] > 5.0)
       and (last_candle["RSI_3_15m"] > 15.0)
       and (last_candle["RSI_3_1h"] > 20.0)
@@ -48414,12 +48245,11 @@ class NostalgiaForInfinityX7(IStrategy):
       return True
     # AROONU 4h uptrend pullback recovery
     if (
-      (last_candle["RSI_3"] > 8.0)
+      (last_candle["RSI_3"] > 10.0)
       and (last_candle["RSI_3_1h"] > 20.0)
       and (last_candle["RSI_14"] < 42.0)
-      and (last_candle["RSI_14_4h"] > 40.0)
-      and (last_candle["AROONU_14"] < 35.0)
-      and (last_candle["AROONU_14_4h"] > 60.0)
+      and (last_candle["AROONU_14"] < 30.0)
+      and (last_candle["AROONU_14_4h"] > 50.0)
       and (last_candle["ROC_9_1d"] > -15.0)
       and (last_candle["close"] < (last_candle["close_max_48"] * 0.95))
     ):
@@ -48478,33 +48308,29 @@ class NostalgiaForInfinityX7(IStrategy):
     **kwargs,
   ):
     is_backtest = self.dp.runmode.value in ["backtest", "hyperopt"]
-    min_stake = self.correct_min_stake(min_stake)
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
+    min_stake = self.correct_min_stake(min_stake)
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
+
+    exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
     count_of_entries = trade.nr_of_successful_entries
     count_of_exits = trade.nr_of_successful_exits
 
     if count_of_entries == 0:
       return None
 
-    if len(filled_orders) < 1:
-      return None
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
-    exit_rate = current_rate
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -48517,9 +48343,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     slice_amount = filled_entries[0].cost
     slice_profit = (exit_rate - filled_orders[-1].safe_price) / filled_orders[-1].safe_price
@@ -48550,7 +48376,7 @@ class NostalgiaForInfinityX7(IStrategy):
         if self.is_futures_mode
         else self.grind_mode_stake_multiplier_spot[0]
       )
-    elif not is_derisk and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 2, 5) or is_backtest):
+    elif not is_derisk and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 2, 5)):
       rebuy_stake, order_tag, is_derisk_calc = self.long_adjust_trade_position_no_derisk(
         trade,
         enter_tags,
@@ -48577,6 +48403,7 @@ class NostalgiaForInfinityX7(IStrategy):
         profit_init_ratio,
         current_stake_amount,
         has_order_tags,
+        count_of_exits,
       )
       if rebuy_stake is not None:
         if has_order_tags:
@@ -48590,7 +48417,7 @@ class NostalgiaForInfinityX7(IStrategy):
 
     if not is_rebuy_mode and not is_grind_mode:
       # First entry is lower now, therefore the grinds must adjust
-      if trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest:
+      if is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16):
         slice_amount /= (
           self.regular_mode_stake_multiplier_futures[0]
           if self.is_futures_mode
@@ -48611,14 +48438,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_1_max_sub_grinds = 0
-    grind_1_stakes = self.grind_1_stakes_futures.copy() if self.is_futures_mode else self.grind_1_stakes_spot.copy()
+    grind_1_stakes = self.scale_stakes_for_min_stake(
+      self.grind_1_stakes_futures if self.is_futures_mode else self.grind_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_1_sub_thresholds = (
       self.grind_1_sub_thresholds_futures if self.is_futures_mode else self.grind_1_sub_thresholds_spot
     )
-    if (slice_amount * grind_1_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_1_stakes):
-        grind_1_stakes[i] *= multi
     grind_1_max_sub_grinds = len(grind_1_stakes)
     grind_1_stop_grinds = self.grind_1_stop_grinds_futures if self.is_futures_mode else self.grind_1_stop_grinds_spot
     grind_1_profit_threshold = (
@@ -48626,14 +48455,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_2_max_sub_grinds = 0
-    grind_2_stakes = self.grind_2_stakes_futures.copy() if self.is_futures_mode else self.grind_2_stakes_spot.copy()
+    grind_2_stakes = self.scale_stakes_for_min_stake(
+      self.grind_2_stakes_futures if self.is_futures_mode else self.grind_2_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_2_sub_thresholds = (
       self.grind_2_sub_thresholds_futures if self.is_futures_mode else self.grind_2_sub_thresholds_spot
     )
-    if (slice_amount * grind_2_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_2_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_2_stakes):
-        grind_2_stakes[i] *= multi
     grind_2_max_sub_grinds = len(grind_2_stakes)
     grind_2_stop_grinds = self.grind_2_stop_grinds_futures if self.is_futures_mode else self.grind_2_stop_grinds_spot
     grind_2_profit_threshold = (
@@ -48641,14 +48472,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_3_max_sub_grinds = 0
-    grind_3_stakes = self.grind_3_stakes_futures.copy() if self.is_futures_mode else self.grind_3_stakes_spot.copy()
+    grind_3_stakes = self.scale_stakes_for_min_stake(
+      self.grind_3_stakes_futures if self.is_futures_mode else self.grind_3_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_3_sub_thresholds = (
       self.grind_3_sub_thresholds_futures if self.is_futures_mode else self.grind_3_sub_thresholds_spot
     )
-    if (slice_amount * grind_3_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_3_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_3_stakes):
-        grind_3_stakes[i] *= multi
     grind_3_max_sub_grinds = len(grind_3_stakes)
     grind_3_stop_grinds = self.grind_3_stop_grinds_futures if self.is_futures_mode else self.grind_3_stop_grinds_spot
     grind_3_profit_threshold = (
@@ -48656,14 +48489,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_4_max_sub_grinds = 0
-    grind_4_stakes = self.grind_4_stakes_futures.copy() if self.is_futures_mode else self.grind_4_stakes_spot.copy()
+    grind_4_stakes = self.scale_stakes_for_min_stake(
+      self.grind_4_stakes_futures if self.is_futures_mode else self.grind_4_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_4_sub_thresholds = (
       self.grind_4_sub_thresholds_futures if self.is_futures_mode else self.grind_4_sub_thresholds_spot
     )
-    if (slice_amount * grind_4_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_4_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_4_stakes):
-        grind_4_stakes[i] *= multi
     grind_4_max_sub_grinds = len(grind_4_stakes)
     grind_4_stop_grinds = self.grind_4_stop_grinds_futures if self.is_futures_mode else self.grind_4_stop_grinds_spot
     grind_4_profit_threshold = (
@@ -48671,14 +48506,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_5_max_sub_grinds = 0
-    grind_5_stakes = self.grind_5_stakes_futures.copy() if self.is_futures_mode else self.grind_5_stakes_spot.copy()
+    grind_5_stakes = self.scale_stakes_for_min_stake(
+      self.grind_5_stakes_futures if self.is_futures_mode else self.grind_5_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_5_sub_thresholds = (
       self.grind_5_sub_thresholds_futures if self.is_futures_mode else self.grind_5_sub_thresholds_spot
     )
-    if (slice_amount * grind_5_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_5_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_5_stakes):
-        grind_5_stakes[i] *= multi
     grind_5_max_sub_grinds = len(grind_5_stakes)
     grind_5_stop_grinds = self.grind_5_stop_grinds_futures if self.is_futures_mode else self.grind_5_stop_grinds_spot
     grind_5_profit_threshold = (
@@ -48686,14 +48523,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_6_max_sub_grinds = 0
-    grind_6_stakes = self.grind_6_stakes_futures.copy() if self.is_futures_mode else self.grind_6_stakes_spot.copy()
+    grind_6_stakes = self.scale_stakes_for_min_stake(
+      self.grind_6_stakes_futures if self.is_futures_mode else self.grind_6_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_6_sub_thresholds = (
       self.grind_6_sub_thresholds_futures if self.is_futures_mode else self.grind_6_sub_thresholds_spot
     )
-    if (slice_amount * grind_6_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_6_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_6_stakes):
-        grind_6_stakes[i] *= multi
     grind_6_max_sub_grinds = len(grind_6_stakes)
     grind_6_stop_grinds = self.grind_6_stop_grinds_futures if self.is_futures_mode else self.grind_6_stop_grinds_spot
     grind_6_profit_threshold = (
@@ -48701,18 +48540,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_1_derisk_1_max_sub_grinds = 0
-    grind_1_derisk_1_stakes = (
-      self.grind_1_derisk_1_stakes_futures.copy() if self.is_futures_mode else self.grind_1_derisk_1_stakes_spot.copy()
+    grind_1_derisk_1_stakes = self.scale_stakes_for_min_stake(
+      self.grind_1_derisk_1_stakes_futures if self.is_futures_mode else self.grind_1_derisk_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_1_derisk_1_sub_thresholds = (
       self.grind_1_derisk_1_sub_thresholds_futures
       if self.is_futures_mode
       else self.grind_1_derisk_1_sub_thresholds_spot
     )
-    if (slice_amount * grind_1_derisk_1_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_1_derisk_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_1_derisk_1_stakes):
-        grind_1_derisk_1_stakes[i] *= multi
     grind_1_derisk_1_max_sub_grinds = len(grind_1_derisk_1_stakes)
     grind_1_derisk_1_stop_grinds = (
       self.grind_1_derisk_1_stop_grinds_futures if self.is_futures_mode else self.grind_1_derisk_1_stop_grinds_spot
@@ -48724,18 +48563,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_2_derisk_1_max_sub_grinds = 0
-    grind_2_derisk_1_stakes = (
-      self.grind_2_derisk_1_stakes_futures.copy() if self.is_futures_mode else self.grind_2_derisk_1_stakes_spot.copy()
+    grind_2_derisk_1_stakes = self.scale_stakes_for_min_stake(
+      self.grind_2_derisk_1_stakes_futures if self.is_futures_mode else self.grind_2_derisk_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_2_derisk_1_sub_thresholds = (
       self.grind_2_derisk_1_sub_thresholds_futures
       if self.is_futures_mode
       else self.grind_2_derisk_1_sub_thresholds_spot
     )
-    if (slice_amount * grind_2_derisk_1_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_2_derisk_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_2_derisk_1_stakes):
-        grind_2_derisk_1_stakes[i] *= multi
     grind_2_derisk_1_max_sub_grinds = len(grind_2_derisk_1_stakes)
     grind_2_derisk_1_stop_grinds = (
       self.grind_2_derisk_1_stop_grinds_futures if self.is_futures_mode else self.grind_2_derisk_1_stop_grinds_spot
@@ -48956,10 +48795,7 @@ class NostalgiaForInfinityX7(IStrategy):
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
+            order_tag = order.ft_order_tag.partition(" ")[0]
         if order_tag in ["dl1", "ddl1"]:
           grind_1_derisk_1_is_sell_found = True
         elif order_tag in ["dl2", "ddl2"]:
@@ -48974,13 +48810,13 @@ class NostalgiaForInfinityX7(IStrategy):
           grind_3_is_sell_found = True
         elif order_tag in ["gd2", "dd2"]:
           grind_2_is_sell_found = True
-        elif order_tag in ["d1"]:
+        elif order_tag == "d1":
           if not is_derisk_1_found:
             is_derisk_1_found = True
             is_derisk_1 = True
             derisk_1_order = order
         elif order_tag in ["p", "r", "d", "dd0", "partial_exit", "force_exit", ""]:
-          if order_tag in ["d"]:
+          if order_tag == "d":
             is_derisk_found = True
             is_derisk = True
           grind_1_is_sell_found = True
@@ -49123,10 +48959,7 @@ class NostalgiaForInfinityX7(IStrategy):
           order_tag = ""
           if has_order_tags:
             if order.ft_order_tag is not None:
-              sell_order_tag = order.ft_order_tag
-              order_mode = sell_order_tag.split(" ", 1)
-              if len(order_mode) > 0:
-                order_tag = order_mode[0]
+              order_tag = order.ft_order_tag.partition(" ")[0]
           else:
             # no order tag support, assume the first exit is for the first buy
             is_first_entry_exit_found = True
@@ -49329,7 +49162,7 @@ class NostalgiaForInfinityX7(IStrategy):
       and (grind_1_derisk_1_current_grind_stake_profit < (slice_amount * grind_1_derisk_1_stop_grinds))
       and (is_derisk or is_derisk_calc)
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_1_derisk_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -49480,7 +49313,7 @@ class NostalgiaForInfinityX7(IStrategy):
       and (grind_2_derisk_1_current_grind_stake_profit < (slice_amount * grind_2_derisk_1_stop_grinds))
       and (is_derisk or is_derisk_calc)
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_2_derisk_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -49663,7 +49496,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -49803,7 +49636,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_2_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -49943,7 +49776,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_3_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -50083,7 +49916,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_4_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -50223,7 +50056,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_5_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -50363,7 +50196,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_6_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -50693,40 +50526,37 @@ class NostalgiaForInfinityX7(IStrategy):
     profit_init_ratio: float,
     current_stake_amount: float,
     has_order_tags: bool,
+    count_of_exits: int,
     **kwargs,
   ) -> tuple[Optional[float], str, bool]:
     is_backtest = self.dp.runmode.value in ["backtest", "hyperopt"]
 
     max_rebuy_sub_grinds = 0
-    regular_mode_rebuy_stakes = (
-      self.regular_mode_rebuy_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_rebuy_stakes_spot.copy()
+    regular_mode_rebuy_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_rebuy_stakes_futures if self.is_futures_mode else self.regular_mode_rebuy_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_rebuy_sub_thresholds = (
       self.regular_mode_rebuy_thresholds_futures if self.is_futures_mode else self.regular_mode_rebuy_thresholds_spot
     )
-    if (slice_amount * regular_mode_rebuy_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_rebuy_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_rebuy_stakes):
-        regular_mode_rebuy_stakes[i] *= multi
     max_rebuy_sub_grinds = len(regular_mode_rebuy_stakes)
 
     max_grind_1_sub_grinds = 0
-    regular_mode_grind_1_stakes = (
-      self.regular_mode_grind_1_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_1_stakes_spot.copy()
+    regular_mode_grind_1_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_1_stakes_futures if self.is_futures_mode else self.regular_mode_grind_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_1_sub_thresholds = (
       self.regular_mode_grind_1_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_1_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_1_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_1_stakes):
-        regular_mode_grind_1_stakes[i] *= multi
     max_grind_1_sub_grinds = len(regular_mode_grind_1_stakes)
     regular_mode_grind_1_stop_grinds = (
       self.regular_mode_grind_1_stop_grinds_futures
@@ -50740,20 +50570,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_2_sub_grinds = 0
-    regular_mode_grind_2_stakes = (
-      self.regular_mode_grind_2_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_2_stakes_spot.copy()
+    regular_mode_grind_2_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_2_stakes_futures if self.is_futures_mode else self.regular_mode_grind_2_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_2_sub_thresholds = (
       self.regular_mode_grind_2_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_2_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_2_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_2_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_2_stakes):
-        regular_mode_grind_2_stakes[i] *= multi
     max_grind_2_sub_grinds = len(regular_mode_grind_2_stakes)
     regular_mode_grind_2_stop_grinds = (
       self.regular_mode_grind_2_stop_grinds_futures
@@ -50767,20 +50595,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_3_sub_grinds = 0
-    regular_mode_grind_3_stakes = (
-      self.regular_mode_grind_3_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_3_stakes_spot.copy()
+    regular_mode_grind_3_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_3_stakes_futures if self.is_futures_mode else self.regular_mode_grind_3_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_3_sub_thresholds = (
       self.regular_mode_grind_3_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_3_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_3_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_3_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_3_stakes):
-        regular_mode_grind_3_stakes[i] *= multi
     max_grind_3_sub_grinds = len(regular_mode_grind_3_stakes)
     regular_mode_grind_3_stop_grinds = (
       self.regular_mode_grind_3_stop_grinds_futures
@@ -50794,20 +50620,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_4_sub_grinds = 0
-    regular_mode_grind_4_stakes = (
-      self.regular_mode_grind_4_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_4_stakes_spot.copy()
+    regular_mode_grind_4_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_4_stakes_futures if self.is_futures_mode else self.regular_mode_grind_4_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_4_sub_thresholds = (
       self.regular_mode_grind_4_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_4_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_4_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_4_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_4_stakes):
-        regular_mode_grind_4_stakes[i] *= multi
     max_grind_4_sub_grinds = len(regular_mode_grind_4_stakes)
     regular_mode_grind_4_stop_grinds = (
       self.regular_mode_grind_4_stop_grinds_futures
@@ -50821,20 +50645,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_5_sub_grinds = 0
-    regular_mode_grind_5_stakes = (
-      self.regular_mode_grind_5_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_5_stakes_spot.copy()
+    regular_mode_grind_5_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_5_stakes_futures if self.is_futures_mode else self.regular_mode_grind_5_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_5_sub_thresholds = (
       self.regular_mode_grind_5_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_5_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_5_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_5_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_5_stakes):
-        regular_mode_grind_5_stakes[i] *= multi
     max_grind_5_sub_grinds = len(regular_mode_grind_5_stakes)
     regular_mode_grind_5_stop_grinds = (
       self.regular_mode_grind_5_stop_grinds_futures
@@ -50848,20 +50670,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_6_sub_grinds = 0
-    regular_mode_grind_6_stakes = (
-      self.regular_mode_grind_6_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_6_stakes_spot.copy()
+    regular_mode_grind_6_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_6_stakes_futures if self.is_futures_mode else self.regular_mode_grind_6_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_6_sub_thresholds = (
       self.regular_mode_grind_6_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_6_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_6_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_6_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_6_stakes):
-        regular_mode_grind_6_stakes[i] *= multi
     max_grind_6_sub_grinds = len(regular_mode_grind_6_stakes)
     regular_mode_grind_6_stop_grinds = (
       self.regular_mode_grind_6_stop_grinds_futures
@@ -51042,10 +50862,7 @@ class NostalgiaForInfinityX7(IStrategy):
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
+            order_tag = order.ft_order_tag.partition(" ")[0]
         if order_tag in ["g1", "sg1"]:
           grind_1_is_sell_found = True
         elif order_tag in ["g2", "sg2"]:
@@ -51060,7 +50877,7 @@ class NostalgiaForInfinityX7(IStrategy):
           grind_6_is_sell_found = True
         elif order_tag in ["d", "d1", "dd0", "ddl1", "ddl2", "dd1", "dd2", "dd3", "dd4", "dd5", "dd6"]:
           is_derisk = True
-          if order_tag in ["d1"]:
+          if order_tag == "d1":
             is_derisk_1 = True
           grind_1_is_sell_found = True
           grind_2_is_sell_found = True
@@ -51121,7 +50938,7 @@ class NostalgiaForInfinityX7(IStrategy):
     # The trade already de-risked
     if is_derisk:
       return None, "", is_derisk
-    if not has_order_tags and len(filled_exits) > 0:
+    if not has_order_tags and count_of_exits > 0:
       return None, "", is_derisk
 
     if rebuy_sub_grind_count > 0:
@@ -51361,7 +51178,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (((exit_rate - grind_1_current_open_rate) / grind_1_current_open_rate) < regular_mode_grind_1_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -51490,7 +51307,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (((exit_rate - grind_2_current_open_rate) / grind_2_current_open_rate) < regular_mode_grind_2_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_2_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -51619,7 +51436,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (((exit_rate - grind_3_current_open_rate) / grind_3_current_open_rate) < regular_mode_grind_3_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_3_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -51748,7 +51565,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (((exit_rate - grind_4_current_open_rate) / grind_4_current_open_rate) < regular_mode_grind_4_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_4_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -51877,7 +51694,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (((exit_rate - grind_5_current_open_rate) / grind_5_current_open_rate) < regular_mode_grind_5_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_5_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -52006,7 +51823,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (((exit_rate - grind_6_current_open_rate) / grind_6_current_open_rate) < regular_mode_grind_6_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_6_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -52052,13 +51869,13 @@ class NostalgiaForInfinityX7(IStrategy):
           slice_amount
           * (
             (self.regular_mode_derisk_futures if self.is_futures_mode else self.regular_mode_derisk_spot)
-            if (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+            if (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
             else (self.regular_mode_derisk_futures_old if self.is_futures_mode else self.regular_mode_derisk_spot_old)
           )
           / trade.leverage
         )
       )
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = trade.amount * exit_rate / trade.leverage - (min_stake * 1.55)
       ft_sell_amount = sell_amount * trade.leverage * (trade.stake_amount / trade.amount) / exit_rate
@@ -52086,7 +51903,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.derisk_enable
       and has_order_tags
       and not is_derisk_1
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
       and profit_stake
       < (
         slice_amount
@@ -52099,7 +51916,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if is_scalp_mode
           else (
             (self.regular_mode_derisk_1_futures if self.is_futures_mode else self.regular_mode_derisk_1_spot)
-            if (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+            if (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
             else (
               self.regular_mode_derisk_1_futures_old if self.is_futures_mode else self.regular_mode_derisk_1_spot_old
             )
@@ -52150,32 +51967,31 @@ class NostalgiaForInfinityX7(IStrategy):
   ) -> Optional[float]:
     # min/max stakes include leverage. The return amounts is before leverage.
     min_stake /= trade.leverage
-    max_stake /= trade.leverage
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
+    max_stake /= trade.leverage
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
+
+    exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
     count_of_entries = trade.nr_of_successful_entries
     count_of_exits = trade.nr_of_successful_exits
 
     if count_of_entries == 0:
       return None
 
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
     # The first exit is de-risk (providing the trade is still open)
-    if (count_of_exits > 0) and (filled_exits[0].ft_order_tag in ["derisk_level_3"]):
+    if (count_of_exits > 0) and (filled_exits[0].ft_order_tag == "derisk_level_3"):
       return self.long_grind_adjust_trade_position_v2(
         trade,
         enter_tags,
@@ -52190,7 +52006,6 @@ class NostalgiaForInfinityX7(IStrategy):
         current_exit_profit,
       )
 
-    exit_rate = current_rate
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -52203,9 +52018,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     slice_amount = filled_entries[0].cost
     slice_profit = (exit_rate - filled_orders[-1].safe_price) / filled_orders[-1].safe_price
@@ -52337,32 +52152,31 @@ class NostalgiaForInfinityX7(IStrategy):
   ) -> Optional[float]:
     # min/max stakes include leverage. The return amounts is before leverage.
     min_stake /= trade.leverage
-    max_stake /= trade.leverage
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
+    max_stake /= trade.leverage
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
+
+    exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
     count_of_entries = trade.nr_of_successful_entries
     count_of_exits = trade.nr_of_successful_exits
 
     if count_of_entries == 0:
       return None
 
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
     # The first exit is de-risk (providing the trade is still open)
-    if (count_of_exits > 0) and (filled_exits[0].ft_order_tag in ["derisk_level_3"]):
+    if (count_of_exits > 0) and (filled_exits[0].ft_order_tag == "derisk_level_3"):
       return self.long_grind_adjust_trade_position_v3(
         trade,
         enter_tags,
@@ -52377,7 +52191,6 @@ class NostalgiaForInfinityX7(IStrategy):
         current_exit_profit,
       )
 
-    exit_rate = current_rate
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -52390,9 +52203,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     slice_amount = filled_entries[0].cost
     slice_profit = (exit_rate - filled_orders[-1].safe_price) / filled_orders[-1].safe_price
@@ -52552,6 +52365,7 @@ class NostalgiaForInfinityX7(IStrategy):
     profit_init_ratio: float,
     max_profit: float,
     max_loss: float,
+    filled_orders,
     filled_entries,
     filled_exits,
     last_candle,
@@ -52691,7 +52505,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.short_normal_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.short_normal_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.005):
           mark_pair, mark_signal = self.mark_profit_target(
             self.short_normal_mode_name,
@@ -52708,7 +52522,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.short_normal_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.short_normal_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -52950,7 +52764,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.short_pump_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.short_pump_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.005):
           mark_pair, mark_signal = self.mark_profit_target(
             self.short_pump_mode_name,
@@ -52967,7 +52781,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.short_pump_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.short_pump_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -53232,7 +53046,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.short_quick_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.short_quick_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.001):
           mark_pair, mark_signal = self.mark_profit_target(
             self.short_quick_mode_name,
@@ -53249,7 +53063,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.short_quick_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.short_quick_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -53365,9 +53179,7 @@ class NostalgiaForInfinityX7(IStrategy):
     enter_tags,
   ) -> tuple:
     is_backtest = self.is_backtest_mode()
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
     sell = False
 
     # Original sell signals
@@ -53485,7 +53297,7 @@ class NostalgiaForInfinityX7(IStrategy):
             / trade.leverage
           )
           # temporary
-          and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+          and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
         ):
           sell, signal_name = True, f"exit_{self.short_rebuy_mode_name}_stoploss_doom"
 
@@ -53517,7 +53329,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.short_rebuy_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.short_rebuy_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.001):
           mark_pair, mark_signal = self.mark_profit_target(
             self.short_rebuy_mode_name,
@@ -53534,7 +53346,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.short_rebuy_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.short_rebuy_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -53747,7 +53559,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.short_high_profit_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.short_high_profit_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.001):
           mark_pair, mark_signal = self.mark_profit_target(
             self.short_high_profit_mode_name,
@@ -53764,7 +53576,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.short_high_profit_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.short_high_profit_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -53872,9 +53684,7 @@ class NostalgiaForInfinityX7(IStrategy):
     enter_tags,
   ) -> tuple:
     is_backtest = self.is_backtest_mode()
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
     sell = False
     signal_name = None
 
@@ -54038,7 +53848,7 @@ class NostalgiaForInfinityX7(IStrategy):
             )
           )
           # temporary
-          and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+          and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
         ):
           sell, signal_name = True, f"exit_{self.short_rapid_mode_name}_stoploss_doom"
 
@@ -54070,7 +53880,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.short_rapid_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.short_rapid_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.001):
           mark_pair, mark_signal = self.mark_profit_target(
             self.short_rapid_mode_name,
@@ -54087,7 +53897,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.short_rapid_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.short_rapid_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -54358,7 +54168,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.short_top_coins_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.short_top_coins_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.005):
           mark_pair, mark_signal = self.mark_profit_target(
             self.short_top_coins_mode_name,
@@ -54375,7 +54185,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.short_top_coins_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.short_top_coins_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -54490,9 +54300,7 @@ class NostalgiaForInfinityX7(IStrategy):
     current_time: "datetime",
     enter_tags,
   ) -> tuple:
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
     sell = False
 
     # Original sell signals
@@ -54644,7 +54452,7 @@ class NostalgiaForInfinityX7(IStrategy):
       )
       if sell_max and signal_name_max is not None:
         return True, f"{signal_name_max}_m"
-      if previous_sell_reason in [f"exit_{self.short_scalp_mode_name}_stoploss_u_e"]:
+      if previous_sell_reason == f"exit_{self.short_scalp_mode_name}_stoploss_u_e":
         if profit_ratio > (previous_profit + 0.005):
           mark_pair, mark_signal = self.mark_profit_target(
             self.short_scalp_mode_name,
@@ -54661,7 +54469,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if mark_pair:
             self._set_profit_target(pair, mark_signal, current_rate, profit_ratio, current_time)
       elif (profit_init_ratio > (previous_profit + 0.001)) and (
-        previous_sell_reason not in [f"exit_{self.short_scalp_mode_name}_stoploss_doom"]
+        previous_sell_reason != f"exit_{self.short_scalp_mode_name}_stoploss_doom"
       ):
         # Update the target, raise it.
         mark_pair, mark_signal = self.mark_profit_target(
@@ -70472,9 +70280,7 @@ class NostalgiaForInfinityX7(IStrategy):
     buy_tag,
   ) -> tuple:
     is_backtest = self.is_backtest_mode()
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
     if not self.stops_enable:
       return False, None
     if is_system_v3_2:
@@ -70533,9 +70339,11 @@ class NostalgiaForInfinityX7(IStrategy):
             * (self.stop_threshold_doom_futures if self.is_futures_mode else self.stop_threshold_doom_spot)
           )
         )
-        and (self.has_valid_entry_conditions(trade, current_rate, last_candle, previous_candle_1) == False)
+        and (
+          self.has_valid_entry_conditions(trade, current_rate, last_candle, previous_candle_1, filled_entries) == False
+        )
         # temporary
-        and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+        and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
       ):
         return True, f"exit_{mode_name}_stoploss_doom"
 
@@ -70556,7 +70364,7 @@ class NostalgiaForInfinityX7(IStrategy):
       and (last_candle["RSI_14"] < (last_candle["RSI_14_1h"] - 24.0))
       # and (current_time - timedelta(minutes=720) > trade.open_date_utc)
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2025, 4, 3) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2025, 4, 3))
     ):
       return True, f"exit_{mode_name}_stoploss_u_e"
 
@@ -70604,24 +70412,23 @@ class NostalgiaForInfinityX7(IStrategy):
     **kwargs,
   ):
     is_backtest = self.is_backtest_mode()
-    min_stake = self.correct_min_stake(min_stake)
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
-    count_of_entries = trade.nr_of_successful_entries
-    count_of_exits = trade.nr_of_successful_exits
+    min_stake = self.correct_min_stake(min_stake)
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
 
     exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
+    count_of_exits = trade.nr_of_successful_exits
+
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -70634,9 +70441,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     current_stake_amount = trade.amount * exit_rate
     slice_amount = filled_entries[0].cost
@@ -70651,26 +70458,22 @@ class NostalgiaForInfinityX7(IStrategy):
       and all(c in (self.short_rebuy_mode_tags + self.short_grind_mode_tags) for c in enter_tags)
     )
 
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
     fee_open_rate = trade.fee_open if self.custom_fee_open_rate is None else self.custom_fee_open_rate
     fee_close_rate = trade.fee_close if self.custom_fee_close_rate is None else self.custom_fee_close_rate
 
     grind_1_max_sub_grinds = 0
-    grind_1_stakes = (
-      self.grinding_v2_grind_1_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_1_stakes_spot.copy()
+    grind_1_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_1_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_1_sub_thresholds = (
       self.grinding_v2_grind_1_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_1_thresholds_spot
     )
-    if (slice_amount * grind_1_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_1_stakes):
-        grind_1_stakes[i] *= multi
     grind_1_max_sub_grinds = len(grind_1_stakes)
     grind_1_derisk_grinds = (
       self.grinding_v2_grind_1_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_1_derisk_spot
@@ -70682,18 +70485,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_2_max_sub_grinds = 0
-    grind_2_stakes = (
-      self.grinding_v2_grind_2_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_2_stakes_spot.copy()
+    grind_2_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_2_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_2_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_2_sub_thresholds = (
       self.grinding_v2_grind_2_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_2_thresholds_spot
     )
-    if (slice_amount * grind_2_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_2_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_2_stakes):
-        grind_2_stakes[i] *= multi
     grind_2_max_sub_grinds = len(grind_2_stakes)
     grind_2_derisk_grinds = (
       self.grinding_v2_grind_2_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_2_derisk_spot
@@ -70705,18 +70506,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_3_max_sub_grinds = 0
-    grind_3_stakes = (
-      self.grinding_v2_grind_3_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_3_stakes_spot.copy()
+    grind_3_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_3_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_3_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_3_sub_thresholds = (
       self.grinding_v2_grind_3_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_3_thresholds_spot
     )
-    if (slice_amount * grind_3_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_3_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_3_stakes):
-        grind_3_stakes[i] *= multi
     grind_3_max_sub_grinds = len(grind_3_stakes)
     grind_3_derisk_grinds = (
       self.grinding_v2_grind_3_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_3_derisk_spot
@@ -70728,18 +70527,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_4_max_sub_grinds = 0
-    grind_4_stakes = (
-      self.grinding_v2_grind_4_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_4_stakes_spot.copy()
+    grind_4_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_4_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_4_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_4_sub_thresholds = (
       self.grinding_v2_grind_4_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_4_thresholds_spot
     )
-    if (slice_amount * grind_4_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_4_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_4_stakes):
-        grind_4_stakes[i] *= multi
     grind_4_max_sub_grinds = len(grind_4_stakes)
     grind_4_derisk_grinds = (
       self.grinding_v2_grind_4_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_4_derisk_spot
@@ -70751,18 +70548,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_5_max_sub_grinds = 0
-    grind_5_stakes = (
-      self.grinding_v2_grind_5_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.grinding_v2_grind_5_stakes_spot.copy()
+    grind_5_stakes = self.scale_stakes_for_min_stake(
+      self.grinding_v2_grind_5_stakes_futures if self.is_futures_mode else self.grinding_v2_grind_5_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_5_sub_thresholds = (
       self.grinding_v2_grind_5_thresholds_futures if self.is_futures_mode else self.grinding_v2_grind_5_thresholds_spot
     )
-    if (slice_amount * grind_5_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_5_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_5_stakes):
-        grind_5_stakes[i] *= multi
     grind_5_max_sub_grinds = len(grind_5_stakes)
     grind_5_derisk_grinds = (
       self.grinding_v2_grind_5_derisk_futures if self.is_futures_mode else self.grinding_v2_grind_5_derisk_spot
@@ -70974,21 +70769,18 @@ class NostalgiaForInfinityX7(IStrategy):
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
+            order_tag = order.ft_order_tag.partition(" ")[0]
         if order_tag in ["derisk_level_1", "d"]:
           if not is_derisk_1_found:
             is_derisk_1_found = True
             is_derisk_1 = True
             derisk_1_order = order
-        elif order_tag in ["derisk_level_2"]:
+        elif order_tag == "derisk_level_2":
           if not is_derisk_2_found:
             is_derisk_2_found = True
             is_derisk_2 = True
             derisk_2_order = order
-        elif order_tag in ["derisk_level_3"]:
+        elif order_tag == "derisk_level_3":
           if not is_derisk_3_found:
             is_derisk_3_found = True
             is_derisk_3 = True
@@ -71017,7 +70809,7 @@ class NostalgiaForInfinityX7(IStrategy):
         elif not grind_5_is_exit_found and order_tag in ["grind_5_exit", "grind_5_derisk"]:
           grind_5_is_exit_found = True
           grind_5_exit_order = order
-        elif order_tag in ["derisk_global"]:
+        elif order_tag == "derisk_global":
           if not buyback_1_is_exit_found:
             buyback_1_is_exit_found = True
             buyback_1_exit_order = order
@@ -71576,7 +71368,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_1_use_derisk
       and (grind_1_sub_grind_count > 0)
       and (grind_1_current_grind_stake_profit < (slice_amount * grind_1_derisk_grinds))
-      and (grind_1_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_1_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -71699,7 +71491,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_2_use_derisk
       and (grind_2_sub_grind_count > 0)
       and (grind_2_current_grind_stake_profit < (slice_amount * grind_2_derisk_grinds))
-      and (grind_2_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_2_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_2_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -71822,7 +71614,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_3_use_derisk
       and (grind_3_sub_grind_count > 0)
       and (grind_3_current_grind_stake_profit < (slice_amount * grind_3_derisk_grinds))
-      and (grind_3_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_3_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_3_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -71960,7 +71752,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_4_use_derisk
       and (grind_4_sub_grind_count > 0)
       and (grind_4_current_grind_stake_profit < (slice_amount * grind_4_derisk_grinds))
-      and (grind_4_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_4_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_4_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -72098,7 +71890,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.grinding_v2_grind_5_use_derisk
       and (grind_5_sub_grind_count > 0)
       and (grind_5_current_grind_stake_profit < (slice_amount * grind_5_derisk_grinds))
-      and (grind_5_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or grind_5_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = grind_5_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -72256,7 +72048,7 @@ class NostalgiaForInfinityX7(IStrategy):
           )
         )
       )
-      and (buyback_1_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or buyback_1_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = buyback_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -72412,7 +72204,7 @@ class NostalgiaForInfinityX7(IStrategy):
           )
         )
       )
-      and (buyback_2_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or buyback_2_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = buyback_2_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -72568,7 +72360,7 @@ class NostalgiaForInfinityX7(IStrategy):
           )
         )
       )
-      and (buyback_3_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3) or is_backtest)
+      and (is_backtest or buyback_3_orders[-1].order_date_utc.replace(tzinfo=None) >= datetime(2025, 8, 3))
     ):
       sell_amount = buyback_3_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -72996,24 +72788,23 @@ class NostalgiaForInfinityX7(IStrategy):
     **kwargs,
   ):
     is_backtest = self.is_backtest_mode()
-    min_stake = self.correct_min_stake(min_stake)
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
-    count_of_entries = trade.nr_of_successful_entries
-    count_of_exits = trade.nr_of_successful_exits
+    min_stake = self.correct_min_stake(min_stake)
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
 
     exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
+    count_of_exits = trade.nr_of_successful_exits
+
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -73026,9 +72817,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     current_stake_amount = trade.amount * exit_rate
     slice_amount = filled_entries[0].cost
@@ -73043,30 +72834,24 @@ class NostalgiaForInfinityX7(IStrategy):
       and all(c in (self.short_rebuy_mode_tags + self.short_grind_mode_tags) for c in enter_tags)
     )
 
-    is_system_v3 = self.is_system_v3(trade)
-    is_system_v3_1 = self.is_system_v3_1(trade)
-    is_system_v3_2 = self.is_system_v3_2(trade)
+    is_system_v3, is_system_v3_1, is_system_v3_2 = self.get_system_version_flags(trade)
 
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
     fee_open_rate = trade.fee_open if self.custom_fee_open_rate is None else self.custom_fee_open_rate
     fee_close_rate = trade.fee_close if self.custom_fee_close_rate is None else self.custom_fee_close_rate
 
     grind_1_max_sub_grinds = 0
-    grind_1_stakes = (
-      self.system_v3_grind_1_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_1_stakes_spot.copy()
+    grind_1_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_1_stakes_futures if self.is_futures_mode else self.system_v3_grind_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     grind_1_sub_thresholds = (
       self.system_v3_grind_1_thresholds_futures if self.is_futures_mode else self.system_v3_grind_1_thresholds_spot
     )
-    if (slice_amount * grind_1_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / grind_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_1_stakes):
-        grind_1_stakes[i] *= multi
     grind_1_max_sub_grinds = len(grind_1_stakes)
     grind_1_derisk_grinds = (
       self.system_v3_grind_1_derisk_futures if self.is_futures_mode else self.system_v3_grind_1_derisk_spot
@@ -73078,18 +72863,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_2_max_sub_grinds = 0
-    grind_2_stakes = (
-      self.system_v3_grind_2_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_2_stakes_spot.copy()
+    grind_2_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_2_stakes_futures if self.is_futures_mode else self.system_v3_grind_2_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_2_sub_thresholds = (
       self.system_v3_grind_2_thresholds_futures if self.is_futures_mode else self.system_v3_grind_2_thresholds_spot
     )
-    if (slice_amount * grind_2_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_2_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_2_stakes):
-        grind_2_stakes[i] *= multi
     grind_2_max_sub_grinds = len(grind_2_stakes)
     grind_2_derisk_grinds = (
       self.system_v3_grind_2_derisk_futures if self.is_futures_mode else self.system_v3_grind_2_derisk_spot
@@ -73101,18 +72884,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_3_max_sub_grinds = 0
-    grind_3_stakes = (
-      self.system_v3_grind_3_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_3_stakes_spot.copy()
+    grind_3_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_3_stakes_futures if self.is_futures_mode else self.system_v3_grind_3_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_3_sub_thresholds = (
       self.system_v3_grind_3_thresholds_futures if self.is_futures_mode else self.system_v3_grind_3_thresholds_spot
     )
-    if (slice_amount * grind_3_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_3_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_3_stakes):
-        grind_3_stakes[i] *= multi
     grind_3_max_sub_grinds = len(grind_3_stakes)
     grind_3_derisk_grinds = (
       self.system_v3_grind_3_derisk_futures if self.is_futures_mode else self.system_v3_grind_3_derisk_spot
@@ -73124,18 +72905,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_4_max_sub_grinds = 0
-    grind_4_stakes = (
-      self.system_v3_grind_4_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_4_stakes_spot.copy()
+    grind_4_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_4_stakes_futures if self.is_futures_mode else self.system_v3_grind_4_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_4_sub_thresholds = (
       self.system_v3_grind_4_thresholds_futures if self.is_futures_mode else self.system_v3_grind_4_thresholds_spot
     )
-    if (slice_amount * grind_4_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_4_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_4_stakes):
-        grind_4_stakes[i] *= multi
     grind_4_max_sub_grinds = len(grind_4_stakes)
     grind_4_derisk_grinds = (
       self.system_v3_grind_4_derisk_futures if self.is_futures_mode else self.system_v3_grind_4_derisk_spot
@@ -73147,18 +72926,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_5_max_sub_grinds = 0
-    grind_5_stakes = (
-      self.system_v3_grind_5_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.system_v3_grind_5_stakes_spot.copy()
+    grind_5_stakes = self.scale_stakes_for_min_stake(
+      self.system_v3_grind_5_stakes_futures if self.is_futures_mode else self.system_v3_grind_5_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_5_sub_thresholds = (
       self.system_v3_grind_5_thresholds_futures if self.is_futures_mode else self.system_v3_grind_5_thresholds_spot
     )
-    if (slice_amount * grind_5_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_5_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_5_stakes):
-        grind_5_stakes[i] *= multi
     grind_5_max_sub_grinds = len(grind_5_stakes)
     grind_5_derisk_grinds = (
       self.system_v3_grind_5_derisk_futures if self.is_futures_mode else self.system_v3_grind_5_derisk_spot
@@ -73334,21 +73111,18 @@ class NostalgiaForInfinityX7(IStrategy):
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
-        if order_tag in ["derisk_level_1"]:
+            order_tag = order.ft_order_tag.partition(" ")[0]
+        if order_tag == "derisk_level_1":
           if not is_derisk_1_found:
             is_derisk_1_found = True
             is_derisk_1 = True
             derisk_1_order = order
-        elif order_tag in ["derisk_level_2"]:
+        elif order_tag == "derisk_level_2":
           if not is_derisk_2_found:
             is_derisk_2_found = True
             is_derisk_2 = True
             derisk_2_order = order
-        elif order_tag in ["derisk_level_3"]:
+        elif order_tag == "derisk_level_3":
           if not is_derisk_3_found:
             is_derisk_3_found = True
             is_derisk_3 = True
@@ -73371,7 +73145,7 @@ class NostalgiaForInfinityX7(IStrategy):
         elif not rebuy_is_exit_found and order_tag in ["rebuy_exit", "rebuy_derisk"]:
           rebuy_is_exit_found = True
           rebuy_exit_order = order
-        elif order_tag in ["derisk_global"]:
+        elif order_tag == "derisk_global":
           if not grind_1_is_exit_found:
             grind_1_is_exit_found = True
             grind_1_exit_order = order
@@ -74057,7 +73831,17 @@ class NostalgiaForInfinityX7(IStrategy):
     if (
       (self.system_v3_grind_4_enable)
       # and is_derisk_1_found
-      and is_short_grind_entry
+      # and is_short_grind_entry
+      and (
+        is_short_grind_entry
+        or (
+          (slice_profit_entry > 0.04)
+          and (last_candle["RSI_3"] < 95.0)
+          and (last_candle["RSI_3_15m"] < 90.0)
+          and (last_candle["RSI_14"] > 65.0)
+          and (last_candle["close"] > (last_candle["EMA_20"] * 1.015))
+        )
+      )
       and is_short_extra_checks_entry
       and (grind_4_sub_grind_count < grind_4_max_sub_grinds)
       and (grind_4_sub_grind_count == 0 or (-grind_4_distance_ratio < grind_4_sub_thresholds[grind_4_sub_grind_count]))
@@ -74618,33 +74402,29 @@ class NostalgiaForInfinityX7(IStrategy):
     **kwargs,
   ):
     is_backtest = self.dp.runmode.value in ["backtest", "hyperopt"]
-    min_stake = self.correct_min_stake(min_stake)
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
+    min_stake = self.correct_min_stake(min_stake)
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
+
+    exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
     count_of_entries = trade.nr_of_successful_entries
     count_of_exits = trade.nr_of_successful_exits
 
     if count_of_entries == 0:
       return None
 
-    if len(filled_orders) < 1:
-      return None
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
-    exit_rate = current_rate
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -74657,9 +74437,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     slice_amount = filled_entries[0].cost
     slice_profit = (exit_rate - filled_orders[-1].safe_price) / filled_orders[-1].safe_price
@@ -74690,7 +74470,7 @@ class NostalgiaForInfinityX7(IStrategy):
         if self.is_futures_mode
         else self.grind_mode_stake_multiplier_spot[0]
       )
-    elif not is_derisk and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 2, 5) or is_backtest):
+    elif not is_derisk and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 2, 5)):
       rebuy_stake, order_tag, is_derisk_calc = self.short_adjust_trade_position_no_derisk(
         trade,
         enter_tags,
@@ -74717,6 +74497,7 @@ class NostalgiaForInfinityX7(IStrategy):
         profit_init_ratio,
         current_stake_amount,
         has_order_tags,
+        count_of_exits,
       )
       if rebuy_stake is not None:
         if has_order_tags:
@@ -74730,7 +74511,7 @@ class NostalgiaForInfinityX7(IStrategy):
 
     if not is_rebuy_mode and not is_grind_mode:
       # First entry is lower now, therefore the grinds must adjust
-      if trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest:
+      if is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16):
         slice_amount /= (
           self.regular_mode_stake_multiplier_futures[0]
           if self.is_futures_mode
@@ -74751,14 +74532,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_1_max_sub_grinds = 0
-    grind_1_stakes = self.grind_1_stakes_futures.copy() if self.is_futures_mode else self.grind_1_stakes_spot.copy()
+    grind_1_stakes = self.scale_stakes_for_min_stake(
+      self.grind_1_stakes_futures if self.is_futures_mode else self.grind_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_1_sub_thresholds = (
       self.grind_1_sub_thresholds_futures if self.is_futures_mode else self.grind_1_sub_thresholds_spot
     )
-    if (slice_amount * grind_1_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_1_stakes):
-        grind_1_stakes[i] *= multi
     grind_1_max_sub_grinds = len(grind_1_stakes)
     grind_1_stop_grinds = self.grind_1_stop_grinds_futures if self.is_futures_mode else self.grind_1_stop_grinds_spot
     grind_1_profit_threshold = (
@@ -74766,14 +74549,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_2_max_sub_grinds = 0
-    grind_2_stakes = self.grind_2_stakes_futures.copy() if self.is_futures_mode else self.grind_2_stakes_spot.copy()
+    grind_2_stakes = self.scale_stakes_for_min_stake(
+      self.grind_2_stakes_futures if self.is_futures_mode else self.grind_2_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_2_sub_thresholds = (
       self.grind_2_sub_thresholds_futures if self.is_futures_mode else self.grind_2_sub_thresholds_spot
     )
-    if (slice_amount * grind_2_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_2_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_2_stakes):
-        grind_2_stakes[i] *= multi
     grind_2_max_sub_grinds = len(grind_2_stakes)
     grind_2_stop_grinds = self.grind_2_stop_grinds_futures if self.is_futures_mode else self.grind_2_stop_grinds_spot
     grind_2_profit_threshold = (
@@ -74781,14 +74566,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_3_max_sub_grinds = 0
-    grind_3_stakes = self.grind_3_stakes_futures.copy() if self.is_futures_mode else self.grind_3_stakes_spot.copy()
+    grind_3_stakes = self.scale_stakes_for_min_stake(
+      self.grind_3_stakes_futures if self.is_futures_mode else self.grind_3_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_3_sub_thresholds = (
       self.grind_3_sub_thresholds_futures if self.is_futures_mode else self.grind_3_sub_thresholds_spot
     )
-    if (slice_amount * grind_3_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_3_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_3_stakes):
-        grind_3_stakes[i] *= multi
     grind_3_max_sub_grinds = len(grind_3_stakes)
     grind_3_stop_grinds = self.grind_3_stop_grinds_futures if self.is_futures_mode else self.grind_3_stop_grinds_spot
     grind_3_profit_threshold = (
@@ -74796,14 +74583,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_4_max_sub_grinds = 0
-    grind_4_stakes = self.grind_4_stakes_futures.copy() if self.is_futures_mode else self.grind_4_stakes_spot.copy()
+    grind_4_stakes = self.scale_stakes_for_min_stake(
+      self.grind_4_stakes_futures if self.is_futures_mode else self.grind_4_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_4_sub_thresholds = (
       self.grind_4_sub_thresholds_futures if self.is_futures_mode else self.grind_4_sub_thresholds_spot
     )
-    if (slice_amount * grind_4_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_4_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_4_stakes):
-        grind_4_stakes[i] *= multi
     grind_4_max_sub_grinds = len(grind_4_stakes)
     grind_4_stop_grinds = self.grind_4_stop_grinds_futures if self.is_futures_mode else self.grind_4_stop_grinds_spot
     grind_4_profit_threshold = (
@@ -74811,14 +74600,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_5_max_sub_grinds = 0
-    grind_5_stakes = self.grind_5_stakes_futures.copy() if self.is_futures_mode else self.grind_5_stakes_spot.copy()
+    grind_5_stakes = self.scale_stakes_for_min_stake(
+      self.grind_5_stakes_futures if self.is_futures_mode else self.grind_5_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_5_sub_thresholds = (
       self.grind_5_sub_thresholds_futures if self.is_futures_mode else self.grind_5_sub_thresholds_spot
     )
-    if (slice_amount * grind_5_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_5_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_5_stakes):
-        grind_5_stakes[i] *= multi
     grind_5_max_sub_grinds = len(grind_5_stakes)
     grind_5_stop_grinds = self.grind_5_stop_grinds_futures if self.is_futures_mode else self.grind_5_stop_grinds_spot
     grind_5_profit_threshold = (
@@ -74826,14 +74617,16 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_6_max_sub_grinds = 0
-    grind_6_stakes = self.grind_6_stakes_futures.copy() if self.is_futures_mode else self.grind_6_stakes_spot.copy()
+    grind_6_stakes = self.scale_stakes_for_min_stake(
+      self.grind_6_stakes_futures if self.is_futures_mode else self.grind_6_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
+    )
     grind_6_sub_thresholds = (
       self.grind_6_sub_thresholds_futures if self.is_futures_mode else self.grind_6_sub_thresholds_spot
     )
-    if (slice_amount * grind_6_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_6_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_6_stakes):
-        grind_6_stakes[i] *= multi
     grind_6_max_sub_grinds = len(grind_6_stakes)
     grind_6_stop_grinds = self.grind_6_stop_grinds_futures if self.is_futures_mode else self.grind_6_stop_grinds_spot
     grind_6_profit_threshold = (
@@ -74841,18 +74634,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_1_derisk_1_max_sub_grinds = 0
-    grind_1_derisk_1_stakes = (
-      self.grind_1_derisk_1_stakes_futures.copy() if self.is_futures_mode else self.grind_1_derisk_1_stakes_spot.copy()
+    grind_1_derisk_1_stakes = self.scale_stakes_for_min_stake(
+      self.grind_1_derisk_1_stakes_futures if self.is_futures_mode else self.grind_1_derisk_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_1_derisk_1_sub_thresholds = (
       self.grind_1_derisk_1_sub_thresholds_futures
       if self.is_futures_mode
       else self.grind_1_derisk_1_sub_thresholds_spot
     )
-    if (slice_amount * grind_1_derisk_1_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_1_derisk_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_1_derisk_1_stakes):
-        grind_1_derisk_1_stakes[i] *= multi
     grind_1_derisk_1_max_sub_grinds = len(grind_1_derisk_1_stakes)
     grind_1_derisk_1_stop_grinds = (
       self.grind_1_derisk_1_stop_grinds_futures if self.is_futures_mode else self.grind_1_derisk_1_stop_grinds_spot
@@ -74864,18 +74657,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     grind_2_derisk_1_max_sub_grinds = 0
-    grind_2_derisk_1_stakes = (
-      self.grind_2_derisk_1_stakes_futures.copy() if self.is_futures_mode else self.grind_2_derisk_1_stakes_spot.copy()
+    grind_2_derisk_1_stakes = self.scale_stakes_for_min_stake(
+      self.grind_2_derisk_1_stakes_futures if self.is_futures_mode else self.grind_2_derisk_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage if self.is_futures_mode else 1.0,
+      trade.leverage,
     )
     grind_2_derisk_1_sub_thresholds = (
       self.grind_2_derisk_1_sub_thresholds_futures
       if self.is_futures_mode
       else self.grind_2_derisk_1_sub_thresholds_spot
     )
-    if (slice_amount * grind_2_derisk_1_stakes[0] / (trade.leverage if self.is_futures_mode else 1.0)) < min_stake:
-      multi = min_stake / slice_amount / grind_2_derisk_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(grind_2_derisk_1_stakes):
-        grind_2_derisk_1_stakes[i] *= multi
     grind_2_derisk_1_max_sub_grinds = len(grind_2_derisk_1_stakes)
     grind_2_derisk_1_stop_grinds = (
       self.grind_2_derisk_1_stop_grinds_futures if self.is_futures_mode else self.grind_2_derisk_1_stop_grinds_spot
@@ -75096,10 +74889,7 @@ class NostalgiaForInfinityX7(IStrategy):
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
+            order_tag = order.ft_order_tag.partition(" ")[0]
         if order_tag in ["dl1", "ddl1"]:
           grind_1_derisk_1_is_sell_found = True
         elif order_tag in ["dl2", "ddl2"]:
@@ -75114,13 +74904,13 @@ class NostalgiaForInfinityX7(IStrategy):
           grind_3_is_sell_found = True
         elif order_tag in ["gd2", "dd2"]:
           grind_2_is_sell_found = True
-        elif order_tag in ["d1"]:
+        elif order_tag == "d1":
           if not is_derisk_1_found:
             is_derisk_1_found = True
             is_derisk_1 = True
             derisk_1_order = order
         elif order_tag in ["p", "r", "d", "dd0", "partial_exit", "force_exit", ""]:
-          if order_tag in ["d"]:
+          if order_tag == "d":
             is_derisk_found = True
             is_derisk = True
           grind_1_is_sell_found = True
@@ -75263,10 +75053,7 @@ class NostalgiaForInfinityX7(IStrategy):
           order_tag = ""
           if has_order_tags:
             if order.ft_order_tag is not None:
-              sell_order_tag = order.ft_order_tag
-              order_mode = sell_order_tag.split(" ", 1)
-              if len(order_mode) > 0:
-                order_tag = order_mode[0]
+              order_tag = order.ft_order_tag.partition(" ")[0]
           else:
             # no order tag support, assume the first exit is for the first buy
             is_first_entry_exit_found = True
@@ -75469,7 +75256,7 @@ class NostalgiaForInfinityX7(IStrategy):
       and (grind_1_derisk_1_current_grind_stake_profit < (slice_amount * grind_1_derisk_1_stop_grinds))
       and (is_derisk or is_derisk_calc)
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_1_derisk_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -75620,7 +75407,7 @@ class NostalgiaForInfinityX7(IStrategy):
       and (grind_2_derisk_1_current_grind_stake_profit < (slice_amount * grind_2_derisk_1_stop_grinds))
       and (is_derisk or is_derisk_calc)
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_2_derisk_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -75803,7 +75590,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -75943,7 +75730,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_2_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -76083,7 +75870,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_3_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -76223,7 +76010,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_4_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -76363,7 +76150,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_5_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -76503,7 +76290,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and (is_derisk or is_derisk_calc or is_grind_mode)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = grind_6_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -76771,40 +76558,37 @@ class NostalgiaForInfinityX7(IStrategy):
     profit_init_ratio: float,
     current_stake_amount: float,
     has_order_tags: bool,
+    count_of_exits: int,
     **kwargs,
   ) -> tuple[Optional[float], str, bool]:
     is_backtest = self.dp.runmode.value in ["backtest", "hyperopt"]
 
     max_rebuy_sub_grinds = 0
-    regular_mode_rebuy_stakes = (
-      self.regular_mode_rebuy_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_rebuy_stakes_spot.copy()
+    regular_mode_rebuy_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_rebuy_stakes_futures if self.is_futures_mode else self.regular_mode_rebuy_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_rebuy_sub_thresholds = (
       self.regular_mode_rebuy_thresholds_futures if self.is_futures_mode else self.regular_mode_rebuy_thresholds_spot
     )
-    if (slice_amount * regular_mode_rebuy_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_rebuy_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_rebuy_stakes):
-        regular_mode_rebuy_stakes[i] *= multi
     max_rebuy_sub_grinds = len(regular_mode_rebuy_stakes)
 
     max_grind_1_sub_grinds = 0
-    regular_mode_grind_1_stakes = (
-      self.regular_mode_grind_1_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_1_stakes_spot.copy()
+    regular_mode_grind_1_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_1_stakes_futures if self.is_futures_mode else self.regular_mode_grind_1_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_1_sub_thresholds = (
       self.regular_mode_grind_1_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_1_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_1_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_1_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_1_stakes):
-        regular_mode_grind_1_stakes[i] *= multi
     max_grind_1_sub_grinds = len(regular_mode_grind_1_stakes)
     regular_mode_grind_1_stop_grinds = (
       self.regular_mode_grind_1_stop_grinds_futures
@@ -76818,20 +76602,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_2_sub_grinds = 0
-    regular_mode_grind_2_stakes = (
-      self.regular_mode_grind_2_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_2_stakes_spot.copy()
+    regular_mode_grind_2_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_2_stakes_futures if self.is_futures_mode else self.regular_mode_grind_2_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_2_sub_thresholds = (
       self.regular_mode_grind_2_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_2_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_2_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_2_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_2_stakes):
-        regular_mode_grind_2_stakes[i] *= multi
     max_grind_2_sub_grinds = len(regular_mode_grind_2_stakes)
     regular_mode_grind_2_stop_grinds = (
       self.regular_mode_grind_2_stop_grinds_futures
@@ -76845,20 +76627,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_3_sub_grinds = 0
-    regular_mode_grind_3_stakes = (
-      self.regular_mode_grind_3_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_3_stakes_spot.copy()
+    regular_mode_grind_3_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_3_stakes_futures if self.is_futures_mode else self.regular_mode_grind_3_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_3_sub_thresholds = (
       self.regular_mode_grind_3_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_3_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_3_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_3_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_3_stakes):
-        regular_mode_grind_3_stakes[i] *= multi
     max_grind_3_sub_grinds = len(regular_mode_grind_3_stakes)
     regular_mode_grind_3_stop_grinds = (
       self.regular_mode_grind_3_stop_grinds_futures
@@ -76872,20 +76652,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_4_sub_grinds = 0
-    regular_mode_grind_4_stakes = (
-      self.regular_mode_grind_4_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_4_stakes_spot.copy()
+    regular_mode_grind_4_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_4_stakes_futures if self.is_futures_mode else self.regular_mode_grind_4_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_4_sub_thresholds = (
       self.regular_mode_grind_4_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_4_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_4_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_4_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_4_stakes):
-        regular_mode_grind_4_stakes[i] *= multi
     max_grind_4_sub_grinds = len(regular_mode_grind_4_stakes)
     regular_mode_grind_4_stop_grinds = (
       self.regular_mode_grind_4_stop_grinds_futures
@@ -76899,20 +76677,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_5_sub_grinds = 0
-    regular_mode_grind_5_stakes = (
-      self.regular_mode_grind_5_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_5_stakes_spot.copy()
+    regular_mode_grind_5_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_5_stakes_futures if self.is_futures_mode else self.regular_mode_grind_5_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_5_sub_thresholds = (
       self.regular_mode_grind_5_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_5_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_5_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_5_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_5_stakes):
-        regular_mode_grind_5_stakes[i] *= multi
     max_grind_5_sub_grinds = len(regular_mode_grind_5_stakes)
     regular_mode_grind_5_stop_grinds = (
       self.regular_mode_grind_5_stop_grinds_futures
@@ -76926,20 +76702,18 @@ class NostalgiaForInfinityX7(IStrategy):
     )
 
     max_grind_6_sub_grinds = 0
-    regular_mode_grind_6_stakes = (
-      self.regular_mode_grind_6_stakes_futures.copy()
-      if self.is_futures_mode
-      else self.regular_mode_grind_6_stakes_spot.copy()
+    regular_mode_grind_6_stakes = self.scale_stakes_for_min_stake(
+      self.regular_mode_grind_6_stakes_futures if self.is_futures_mode else self.regular_mode_grind_6_stakes_spot,
+      slice_amount,
+      min_stake,
+      trade.leverage,
+      trade.leverage,
     )
     regular_mode_grind_6_sub_thresholds = (
       self.regular_mode_grind_6_thresholds_futures
       if self.is_futures_mode
       else self.regular_mode_grind_6_thresholds_spot
     )
-    if (slice_amount * regular_mode_grind_6_stakes[0] / trade.leverage) < min_stake:
-      multi = min_stake / slice_amount / regular_mode_grind_6_stakes[0] * trade.leverage
-      for i, _ in enumerate(regular_mode_grind_6_stakes):
-        regular_mode_grind_6_stakes[i] *= multi
     max_grind_6_sub_grinds = len(regular_mode_grind_6_stakes)
     regular_mode_grind_6_stop_grinds = (
       self.regular_mode_grind_6_stop_grinds_futures
@@ -77120,10 +76894,7 @@ class NostalgiaForInfinityX7(IStrategy):
         order_tag = ""
         if has_order_tags:
           if order.ft_order_tag is not None:
-            sell_order_tag = order.ft_order_tag
-            order_mode = sell_order_tag.split(" ", 1)
-            if len(order_mode) > 0:
-              order_tag = order_mode[0]
+            order_tag = order.ft_order_tag.partition(" ")[0]
         if order_tag in ["g1", "sg1"]:
           grind_1_is_sell_found = True
         elif order_tag in ["g2", "sg2"]:
@@ -77138,7 +76909,7 @@ class NostalgiaForInfinityX7(IStrategy):
           grind_6_is_sell_found = True
         elif order_tag in ["d", "d1", "dd0", "ddl1", "ddl2", "dd1", "dd2", "dd3", "dd4", "dd5", "dd6"]:
           is_derisk = True
-          if order_tag in ["d1"]:
+          if order_tag == "d1":
             is_derisk_1 = True
           grind_1_is_sell_found = True
           grind_2_is_sell_found = True
@@ -77199,7 +76970,7 @@ class NostalgiaForInfinityX7(IStrategy):
     # The trade already de-risked
     if is_derisk:
       return None, "", is_derisk
-    if not has_order_tags and len(filled_exits) > 0:
+    if not has_order_tags and count_of_exits > 0:
       return None, "", is_derisk
 
     if rebuy_sub_grind_count > 0:
@@ -77439,7 +77210,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and ((-(exit_rate - grind_1_current_open_rate) / grind_1_current_open_rate) < regular_mode_grind_1_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_1_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -77568,7 +77339,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and ((-(exit_rate - grind_2_current_open_rate) / grind_2_current_open_rate) < regular_mode_grind_2_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_2_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -77697,7 +77468,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and ((-(exit_rate - grind_3_current_open_rate) / grind_3_current_open_rate) < regular_mode_grind_3_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_3_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -77826,7 +77597,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and ((-(exit_rate - grind_4_current_open_rate) / grind_4_current_open_rate) < regular_mode_grind_4_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_4_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -77955,7 +77726,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and ((-(exit_rate - grind_5_current_open_rate) / grind_5_current_open_rate) < regular_mode_grind_5_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_5_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -78084,7 +77855,7 @@ class NostalgiaForInfinityX7(IStrategy):
         and ((-(exit_rate - grind_6_current_open_rate) / grind_6_current_open_rate) < regular_mode_grind_6_stop_grinds)
       )
       # temporary
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 4, 16))
     ):
       sell_amount = grind_6_total_amount * exit_rate / trade.leverage
       if ((current_stake_amount / trade.leverage) - sell_amount) < (min_stake * 1.55):
@@ -78130,13 +77901,13 @@ class NostalgiaForInfinityX7(IStrategy):
           slice_amount
           * (
             (self.regular_mode_derisk_futures if self.is_futures_mode else self.regular_mode_derisk_spot)
-            if (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+            if (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
             else (self.regular_mode_derisk_futures_old if self.is_futures_mode else self.regular_mode_derisk_spot_old)
           )
           / trade.leverage
         )
       )
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
     ):
       sell_amount = trade.amount * exit_rate / trade.leverage - (min_stake * 1.55)
       ft_sell_amount = sell_amount * trade.leverage * (trade.stake_amount / trade.amount) / exit_rate
@@ -78164,7 +77935,7 @@ class NostalgiaForInfinityX7(IStrategy):
       self.derisk_enable
       and has_order_tags
       and not is_derisk_1
-      and (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+      and (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
       and profit_stake
       < (
         slice_amount
@@ -78177,7 +77948,7 @@ class NostalgiaForInfinityX7(IStrategy):
           if is_scalp_mode
           else (
             (self.regular_mode_derisk_1_futures if self.is_futures_mode else self.regular_mode_derisk_1_spot)
-            if (trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13) or is_backtest)
+            if (is_backtest or trade.open_date_utc.replace(tzinfo=None) >= datetime(2024, 9, 13))
             else (
               self.regular_mode_derisk_1_futures_old if self.is_futures_mode else self.regular_mode_derisk_1_spot_old
             )
@@ -78228,32 +77999,31 @@ class NostalgiaForInfinityX7(IStrategy):
   ) -> Optional[float]:
     # min/max stakes include leverage. The return amounts is before leverage.
     min_stake /= trade.leverage
-    max_stake /= trade.leverage
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
+    max_stake /= trade.leverage
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
+
+    exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
     count_of_entries = trade.nr_of_successful_entries
     count_of_exits = trade.nr_of_successful_exits
 
     if count_of_entries == 0:
       return None
 
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
     # The first exit is de-risk (providing the trade is still open)
-    if (count_of_exits > 0) and (filled_exits[0].ft_order_tag in ["derisk_level_3"]):
+    if (count_of_exits > 0) and (filled_exits[0].ft_order_tag == "derisk_level_3"):
       return self.short_grind_adjust_trade_position_v2(
         trade,
         enter_tags,
@@ -78268,7 +78038,6 @@ class NostalgiaForInfinityX7(IStrategy):
         current_exit_profit,
       )
 
-    exit_rate = current_rate
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -78281,9 +78050,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     slice_amount = filled_entries[0].cost
     slice_profit = (exit_rate - filled_orders[-1].safe_price) / filled_orders[-1].safe_price
@@ -78405,31 +78174,29 @@ class NostalgiaForInfinityX7(IStrategy):
   ) -> Optional[float]:
     # min/max stakes include leverage. The return amounts is before leverage.
     min_stake /= trade.leverage
-    max_stake /= trade.leverage
-    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-    if len(df) < 2:
-      return None
-    last_candle = df.iloc[-1].squeeze()
-    previous_candle = df.iloc[-2].squeeze()
-
     # we already waiting for an order to get filled
     if trade.has_open_orders:
       return None
 
-    filled_orders = trade.select_filled_orders()
-    filled_entries = trade.select_filled_orders(trade.entry_side)
-    filled_exits = trade.select_filled_orders(trade.exit_side)
+    max_stake /= trade.leverage
+    df, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+    if len(df) < 2:
+      return None
+    last_candle = df.iloc[-1]
+    previous_candle = df.iloc[-2]
+
+    exit_rate = current_rate
+    filled_orders, filled_entries, filled_exits, profit_values = self.profit_or_order_snapshot(
+      trade, current_time, exit_rate
+    )
     count_of_entries = trade.nr_of_successful_entries
     count_of_exits = trade.nr_of_successful_exits
 
     if count_of_entries == 0:
       return None
 
-    has_order_tags = False
-    if hasattr(filled_orders[0], "ft_order_tag"):
-      has_order_tags = True
+    has_order_tags = hasattr(filled_orders[0], "ft_order_tag")
 
-    exit_rate = current_rate
     if self.dp.runmode.value in ("live", "dry_run"):
       ticker = self.dp.ticker(trade.pair)
       if ("bid" in ticker) and ("ask" in ticker):
@@ -78442,9 +78209,9 @@ class NostalgiaForInfinityX7(IStrategy):
             if ticker["bid"] is not None:
               exit_rate = ticker["bid"]
 
-    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = self.calc_total_profit(
-      trade, filled_entries, filled_exits, exit_rate
-    )
+    if profit_values is None:
+      profit_values = self.calc_total_profit(trade, filled_entries, filled_exits, exit_rate)
+    profit_stake, profit_ratio, profit_current_stake_ratio, profit_init_ratio = profit_values
 
     slice_amount = filled_entries[0].cost
     slice_profit = (exit_rate - filled_orders[-1].safe_price) / filled_orders[-1].safe_price
