@@ -70,7 +70,7 @@ class NostalgiaForInfinityX8(IStrategy):
   INTERFACE_VERSION = 3
 
   def version(self) -> str:
-    return "v18.0.130"
+    return "v18.0.133"
 
   stoploss = -0.99
 
@@ -466,7 +466,7 @@ class NostalgiaForInfinityX8(IStrategy):
   grinding_v2_derisk_level_1_futures = [-0.18, -0.35]
   grinding_v2_derisk_level_2_enable = True
   grinding_v2_derisk_level_2_spot = [-0.08, -0.18]
-  grinding_v2_derisk_level_2_futures = [-0.16, -0.54]
+  grinding_v2_derisk_level_2_futures = [-0.24, -0.54]
   grinding_v2_derisk_level_3_enable = True
   grinding_v2_derisk_level_3_spot = [-0.10, -0.20]
   grinding_v2_derisk_level_3_futures = [-0.30, -0.60]
@@ -2502,7 +2502,7 @@ class NostalgiaForInfinityX8(IStrategy):
     short_rapid_rebuy_grind_mode_tags = self.short_rapid_rebuy_grind_mode_tags
     short_grind_mode_tags = self.short_grind_mode_tags
 
-    enter_tags = entry_tag.split()
+    enter_tags = (entry_tag or "empty").split()
     is_futures_mode = self.is_futures_mode
     system_name_use = self.system_name_use
     system_name_is_v3 = system_name_use == system_v3_name
@@ -3284,6 +3284,7 @@ class NostalgiaForInfinityX8(IStrategy):
     # =========================================================================
     willr_14 = ta_willr(high_np, low_np, close_np, timeperiod=14)
     roc_2 = ta_roc(close_np, timeperiod=2)
+    roc_7 = ta_roc(close_np, timeperiod=7)
     roc_9 = ta_roc(close_np, timeperiod=9)
 
     # =========================================================================
@@ -3344,6 +3345,7 @@ class NostalgiaForInfinityX8(IStrategy):
         "AROONU_14": aroon_up,
         "AROOND_14": aroon_down,
         "ROC_2": roc_2,
+        "ROC_7": roc_7,
         "ROC_9": roc_9,
         "RSI_3_change_pct": rsi3_change,
         "change_pct": change_pct,
@@ -3377,6 +3379,7 @@ class NostalgiaForInfinityX8(IStrategy):
         "AROONU_14",
         "AROOND_14",
         "ROC_2",
+        "ROC_7",
         "ROC_9",
         "RSI_3_change_pct",
         "change_pct",
@@ -5364,7 +5367,7 @@ class NostalgiaForInfinityX8(IStrategy):
       return True
 
     # Mode Validation
-    entry_tags = entry_tag.split()
+    entry_tags = (entry_tag or "empty").split()
     is_long_side = side == "long"
     is_short_side = side == "short"
     long_grind_mode_tags = self.long_grind_mode_tags
@@ -5548,7 +5551,7 @@ class NostalgiaForInfinityX8(IStrategy):
     side: str,
     **kwargs,
   ) -> float:
-    enter_tags = entry_tag.split()
+    enter_tags = (entry_tag or "empty").split()
     long_rebuy_mode_tags = self.long_rebuy_mode_tags
     long_grind_mode_tags = self.long_grind_mode_tags
     if all(c in long_rebuy_mode_tags for c in enter_tags):
@@ -5818,6 +5821,7 @@ class NostalgiaForInfinityX8(IStrategy):
     rsi_3_1h = np_view("RSI_3_1h")
     rsi_3_15m = np_view("RSI_3_15m")
     rsi_3_4h = np_view("RSI_3_4h")
+    roc_7_1d = np_view("ROC_7_1d")
     roc_9_1d = np_view("ROC_9_1d")
     aroonu_14_4h = np_view("AROONU_14_4h")
     aroonu_14_4h_shift_48 = np_shift(aroonu_14_4h, 48)
@@ -7599,8 +7603,10 @@ class NostalgiaForInfinityX8(IStrategy):
             & ((rsi_3_1h_gt_45) | (rsi_3_4h_gt_65) | (roc_9_1d_lt_200))
             # 1h down move, 1h high, 1d high & overbought
             & ((rsi_3_1h_gt_45) | (stochrsi_k_1h_lt_60) | (stochrsi_k_1d_lt_70) | (roc_9_1d_lt_40))
+            # 1h down move, 1h high, 1d high & overbought
+            & ((rsi_3_1h_gt_50) | (aroonu_14_1h_lt_70) | (aroonu_14_1d_lt_100) | (roc_9_1d_lt_60))
             # 1h down move, 1h high & overbought
-            & ((rsi_3_1h_gt_50) | aroonu_14_1h_lt_80 | (roc_9_1h_lt_10))
+            & ((rsi_3_1h_gt_50) | (aroonu_14_1h_lt_80) | (roc_9_1h_lt_10))
             # 1h down move, 4h high, 1h overbought
             & ((rsi_3_1h_gt_50) | (aroonu_14_4h_lt_85) | (roc_9_1h_lt_20))
             # 1h down move, 4h high, 1d downtrend
@@ -16141,6 +16147,8 @@ class NostalgiaForInfinityX8(IStrategy):
             & ((rsi_3_1h_gt_60) | (rsi_3_4h_gt_65) | (stochrsi_k_4h_lt_80) | (roc_9_1d_lt_10))
             # 1h down move, 15m & 1h & 4h high
             & ((rsi_3_1h_gt_60) | (aroonu_14_15m_lt_60) | (aroonu_14_1h_lt_90) | (aroonu_14_4h_lt_100))
+            # 1h down move, 1h high, 4h high & overbought
+            & ((rsi_3_1h_gt_60) | (aroonu_14_1h_lt_80) | (aroonu_14_4h_lt_100) | (roc_9_4h_lt_10))
             # 1h down move, 1h high, 1d high & overbought
             & ((rsi_3_1h_gt_60) | (stochrsi_k_1h_lt_60) | (stochrsi_k_1d_lt_90) | (roc_9_1d_lt_80))
             # 1h down move, 1d downtrend, 1h high, 4h high
@@ -16352,6 +16360,8 @@ class NostalgiaForInfinityX8(IStrategy):
             & ((rsi_3_1h_gt_60) | (stochrsi_k_1h_lt_70) | (stochrsi_k_4h_lt_80) | (roc_9_1d_lt_80))
             # 1h down move, 4h high, 1d overbought
             & ((rsi_3_1h_gt_65) | (stochrsi_k_4h_lt_80) | (roc_9_1d_lt_100))
+            # 1h up move, 15m high, 1d overbought
+            & ((rsi_3_1h_lt_90) | (aroonu_14_15m_lt_90) | (roc_9_1d_lt_50))
             # 1h up move, 4h downtrend, 15m & 1h high
             & ((rsi_3_1h_lt_95) | (cmf_20_4h_gt_neg_0_10) | (aroonu_14_15m_lt_100) | (aroonu_14_1h_lt_100))
             # 1h up move, 1d high, 1h & 4h overbought
@@ -28126,6 +28136,10 @@ class NostalgiaForInfinityX8(IStrategy):
           short_entry_logic.append(num_empty_288 <= allowed_empty_candles_288)
           short_entry_logic.append(protections_short_global == True)
           short_entry_logic.append(roc_9_1d < 5.0)
+          # TAG562: no shorts within 12% of the 30d high, read off the 1d frame
+          short_entry_logic.append(((close / high_max_30_1d - 1.0) < -0.12) | np.isnan(high_max_30_1d))
+          # TAG562-R2: no shorts into weekly rips, read off the 1d frame
+          short_entry_logic.append((roc_7_1d < 8.0) | np.isnan(roc_7_1d))
           short_entry_logic.append(rsi_14_4h < 48.0)
           short_entry_logic.append(rsi_14_1d < 50.0)
           short_entry_logic.append(rsi_14_1d > 25.0)
